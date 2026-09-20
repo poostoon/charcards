@@ -254,25 +254,55 @@ local function stripHtml(raw)
 end
 
 -- Дістає HTML n-го елемента spine з .epub (n рахується від 1). nil, err якщо не вдалось.
+local function popenRead(cmd)
+    local ok, result = pcall(function()
+        local h = io.popen(cmd, "r")
+        if not h then return nil end
+        local s = h:read("*a"); h:close(); return s
+    end)
+    if ok then return result end
+    return nil
+end
+
+-- Дефіс, крапка та інші символи в id зі spine/manifest — спецсимволи в Lua
+-- patterns (напр. "-" — лінивий повторювач), а не літерали. Без екранування
+-- id з дефісом (звичайнісінька річ: "cover-page", "chapter-5" і т.д.) просто
+-- ніколи не знаходиться, і весь ланцюжок мовчки падає.
+local function escapeLuaPattern(s)
+    return (s:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1"))
+end
+
+-- href у маніфесті OPF за специфікацією МАЄ бути URI-кодованим (те, що
+-- більшість генераторів цього не роблять для ASCII-імен — окрема історія),
+-- і деякі конвертери таки кодують кириличні href як %D0%9B%D0%B5... — тоді
+-- як самі імена файлів у ZIP лежать розкодованими. Без декодування шлях,
+-- який ми підставляємо в unzip -p, просто не існує в архіві.
+local function urlDecode(s)
+    s = s:gsub("+", " ")
+    s = s:gsub("%%(%x%x)", function(hex) return string.char(tonumber(hex, 16)) end)
+    return s
+end
+
+-- Дістає HTML n-го елемента spine з .epub (n рахується від 1). nil, err якщо не вдалось.
+--
+-- ВАЖЛИВО: тут навмисно немає жодного unzip -l (список файлів архіву).
+-- На деяких пристроях (busybox unzip, поширений на бюджетних e-ink) -l
+-- ламається саме на архівах із кириличними/нелатинськими назвами файлів
+-- усередині — повертає порожній вивід, хоча сам файл читається абсолютно
+-- нормально. META-INF/container.xml — фіксований, завжди ASCII шлях за
+-- стандартом EPUB (OCF), тому його можна читати напряму через unzip -p,
+-- а звідти вже дістати справжній шлях до .opf, і так по ланцюжку — без
+-- жодного разу не звертаючись до листингу архіву.
 local function fetchSpineChapterHtml(epub_path, n)
-    local ok_p, listing = pcall(function()
-        local h = io.popen("unzip -l '" .. epub_path .. "' 2>/dev/null", "r")
-        if not h then return nil end
-        local s = h:read("*a"); h:close(); return s
-    end)
-    if not ok_p or type(listing) ~= "string" or #listing < 10 then
-        return nil, "unzip -l не спрацював"
+    local container = popenRead("unzip -p '" .. epub_path .. "' 'META-INF/container.xml' 2>/dev/null")
+    if not container or #container < 20 then
+        return nil, "не вдалося прочитати META-INF/container.xml"
     end
+    local opf_path = container:match('full%-path="([^"]+)"')
+    if not opf_path then return nil, "container.xml: не знайдено full-path" end
 
-    local opf_path = listing:match("([^%s]+%.opf)")
-    if not opf_path then return nil, "не знайдено .opf" end
-
-    local ok2, opf = pcall(function()
-        local h = io.popen("unzip -p '" .. epub_path .. "' '" .. opf_path .. "' 2>/dev/null", "r")
-        if not h then return nil end
-        local s = h:read("*a"); h:close(); return s
-    end)
-    if not ok2 or type(opf) ~= "string" or #opf < 50 then
+    local opf = popenRead("unzip -p '" .. epub_path .. "' '" .. opf_path .. "' 2>/dev/null")
+    if not opf or #opf < 50 then
         return nil, "не вдалося прочитати .opf"
     end
 
@@ -283,19 +313,17 @@ local function fetchSpineChapterHtml(epub_path, n)
     end
     if not item_id then return nil, "spine#" .. n .. " не знайдено" end
 
-    local pat1 = [[item[^>]+href="([^"]+)"[^>]+id="]] .. item_id .. [["]]
-    local pat2 = [[item[^>]+id="]] .. item_id .. [["[^>]+href="([^"]+)"]]
+    local esc_id = escapeLuaPattern(item_id)
+    local pat1 = [[item[^>]+href="([^"]+)"[^>]+id="]] .. esc_id .. [["]]
+    local pat2 = [[item[^>]+id="]] .. esc_id .. [["[^>]+href="([^"]+)"]]
     local href = opf:match(pat2) or opf:match(pat1)
     if not href then return nil, "href для spine-елемента не знайдено" end
+    href = urlDecode(href)
 
     local base = opf_path:match("^(.*/)") or ""
     local full = base .. href
-    local ok3, chapter = pcall(function()
-        local h = io.popen("unzip -p '" .. epub_path .. "' '" .. full .. "' 2>/dev/null", "r")
-        if not h then return nil end
-        local s = h:read("*a"); h:close(); return s
-    end)
-    if not ok3 or type(chapter) ~= "string" or #chapter < 100 then
+    local chapter = popenRead("unzip -p '" .. epub_path .. "' '" .. full .. "' 2>/dev/null")
+    if not chapter or #chapter < 100 then
         return nil, "не вдалося прочитати розділ"
     end
     return chapter
