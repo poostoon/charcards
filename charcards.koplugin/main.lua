@@ -1,7 +1,7 @@
 -- main.lua
 -- CharCards — мінімалістичний, повністю ручний трекер персонажів для KOReader.
 --
--- Жодного автосканування, жодного фонового пошуку по тексту. Дві дії:
+-- Жодного автосканування, жодного фонового пошуку по тексту. Дії:
 --   1) Виділив ім'я персонажа в тексті → "Додати персонажа" — бере це ім'я
 --      + контекст (поточна сторінка + кілька сторінок назад), питає Gemini
 --      повну картку (роль, псевдоніми, професія, зовнішність, характер,
@@ -11,13 +11,19 @@
 --      копіює її) і визначає, ЯКІ поля картки вона поповнює (професія,
 --      зовнішність, характер, звʼязки, псевдоніми, роль) — плагін сам
 --      домішує кожен шматок у потрібне поле, а не в один загальний список.
+--   3) "Серія книг" — за бажанням, книгу можна прив'язати до спільної серії,
+--      щоб персонажі (і вся їхня картка) переходили з першої книги в другу,
+--      а не починались щоразу з нуля.
 --
 -- Дані зберігаються в сайдкарі книги (self.ui.doc_settings) — окремо від
--- будь-якого іншого плагіна, нічого спільного з KoCharacters.
+-- будь-якого іншого плагіна, нічого спільного з KoCharacters. Якщо книга
+-- прив'язана до серії — замість сайдкара книги картки читаються/пишуться
+-- у спільний файл серії (DataStorage:getDataDir() .. "/charcards_series/").
 --
 -- Схема картки (поля як у KoCharacters, для звичного вигляду):
 --   { id, name, aliases[], role, occupation, physical_description,
---     personality, relationships[] }
+--     personality, relationships[], background, relation_to_protagonist,
+--     standout_trait }
 
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local UIManager        = require("ui/uimanager")
@@ -37,6 +43,9 @@ local TextBoxWidget     = require("ui/widget/textboxwidget")
 local Font              = require("ui/font")
 local Geom              = require("ui/geometry")
 local GestureRange      = require("ui/gesturerange")
+local DataStorage       = require("datastorage")
+local LuaSettings       = require("luasettings")
+local lfs               = require("libs/libkoreader-lfs")
 local logger            = require("logger")
 
 local ok_networkmgr, NetworkMgr = pcall(require, "ui/network/manager")
@@ -264,6 +273,31 @@ local function popenRead(cmd)
     return nil
 end
 
+-- Діагностика на випадок, якщо unzip не спрацював: чи є бінарник взагалі,
+-- чи проблема в чомусь іншому (права, шлях до файлу тощо). Викликається
+-- лише коли основний виклик УЖЕ провалився — цінності на успішному шляху
+-- не додає, тому не робимо це на кожен виклик.
+local function diagnoseUnzip(epub_path)
+    local parts = {}
+
+    local which_out = popenRead("command -v unzip 2>&1")
+    if not which_out or which_out:gsub("%s+", "") == "" then
+        table.insert(parts, "бінарник unzip не знайдено в PATH")
+    else
+        table.insert(parts, "unzip знайдено: " .. trim(which_out))
+    end
+
+    local ver_out = popenRead("unzip -v 2>&1")
+    if ver_out and ver_out ~= "" then
+        table.insert(parts, "unzip -v: " .. trim(ver_out:match("^[^\n]*") or ver_out):sub(1, 120))
+    end
+
+    local ok_exists = popenRead("test -f '" .. epub_path .. "' && echo так || echo ні")
+    table.insert(parts, "файл книги існує (test -f): " .. trim(ok_exists or "невідомо"))
+
+    return table.concat(parts, " | ")
+end
+
 -- Дефіс, крапка та інші символи в id зі spine/manifest — спецсимволи в Lua
 -- patterns (напр. "-" — лінивий повторювач), а не літерали. Без екранування
 -- id з дефісом (звичайнісінька річ: "cover-page", "chapter-5" і т.д.) просто
@@ -296,14 +330,14 @@ end
 local function fetchSpineChapterHtml(epub_path, n)
     local container = popenRead("unzip -p '" .. epub_path .. "' 'META-INF/container.xml' 2>/dev/null")
     if not container or #container < 20 then
-        return nil, "не вдалося прочитати META-INF/container.xml"
+        return nil, "не вдалося прочитати META-INF/container.xml (" .. diagnoseUnzip(epub_path) .. ")"
     end
     local opf_path = container:match('full%-path="([^"]+)"')
     if not opf_path then return nil, "container.xml: не знайдено full-path" end
 
     local opf = popenRead("unzip -p '" .. epub_path .. "' '" .. opf_path .. "' 2>/dev/null")
     if not opf or #opf < 50 then
-        return nil, "не вдалося прочитати .opf"
+        return nil, "не вдалося прочитати .opf (" .. diagnoseUnzip(epub_path) .. ")"
     end
 
     local count, item_id = 0, nil
@@ -324,7 +358,7 @@ local function fetchSpineChapterHtml(epub_path, n)
     local full = base .. href
     local chapter = popenRead("unzip -p '" .. epub_path .. "' '" .. full .. "' 2>/dev/null")
     if not chapter or #chapter < 100 then
-        return nil, "не вдалося прочитати розділ"
+        return nil, "не вдалося прочитати розділ (" .. diagnoseUnzip(epub_path) .. ")"
     end
     return chapter
 end
@@ -410,18 +444,90 @@ local function getContextText(self, back_pages)
     return text:sub(s, e)
 end
 
--- ===== Зберігання карток (сайдкар книги, окремо від інших плагінів) =====
+-- ===== Серії книг (спільний пул персонажів на кілька книг) =====
+--
+-- За замовчуванням книга не прив'язана до жодної серії — картки лежать
+-- у сайдкарі книги, як і раніше, кожна книга ізольована. Якщо користувач
+-- явно привʼязує книгу до серії (KoCharacters → Серія книг), картки для
+-- цієї книги перенаправляються в СПІЛЬНИЙ файл серії — читання/запис,
+-- підкреслення в тексті, усе працює з цим спільним пулом. Прив'язка сама
+-- по собі — це один маленький покажчик у сайдкарі КОЖНОЇ книги окремо
+-- (self.ui.doc_settings), тому різні книги можуть незалежно вирішувати,
+-- до якої серії (чи жодної) вони належать.
+
+local SERIES_DIR = DataStorage:getDataDir() .. "/charcards_series"
+
+local function ensureSeriesDir()
+    if lfs.attributes(SERIES_DIR, "mode") ~= "directory" then
+        lfs.mkdir(SERIES_DIR)
+    end
+end
+
+-- Прибираємо символи, небезпечні для імені файлу; кирилицю лишаємо як є.
+local function sanitizeSeriesId(name)
+    return trim(name):gsub('[/\\:%*%?"<>|]', "_")
+end
+
+local function getSeriesFile(series_id)
+    ensureSeriesDir()
+    return LuaSettings:open(SERIES_DIR .. "/" .. series_id .. ".lua")
+end
+
+-- Список усіх наявних серій — {id=, name=} — читає директорію напряму,
+-- окремого індексного файлу не тримаємо (менше що може розсинхронізуватись).
+local function listSeries()
+    ensureSeriesDir()
+    local list = {}
+    for entry in lfs.dir(SERIES_DIR) do
+        if entry:match("%.lua$") then
+            local id = entry:gsub("%.lua$", "")
+            local ok, s = pcall(LuaSettings.open, LuaSettings, SERIES_DIR .. "/" .. entry)
+            local name = (ok and s and s:readSetting("name")) or id
+            table.insert(list, { id = id, name = name })
+        end
+    end
+    table.sort(list, function(a, b) return a.name < b.name end)
+    return list
+end
+
+local function getSeriesId(self)
+    local id = self.ui.doc_settings and self.ui.doc_settings:readSetting("charcards_series_id")
+    if id and id ~= "" then return id end
+    return nil
+end
+
+local function setSeriesId(self, series_id)
+    if not self.ui.doc_settings then return end
+    self.ui.doc_settings:saveSetting("charcards_series_id", series_id or "")
+    self.ui.doc_settings:flush()
+end
+
+-- ===== Зберігання карток (сайдкар книги — або спільний файл серії, якщо привʼязано) =====
 
 local function loadCards(self)
+    local series_id = getSeriesId(self)
+    if series_id then
+        local data = getSeriesFile(series_id):readSetting("cards")
+        if type(data) ~= "table" then data = {} end
+        return data
+    end
     local data = self.ui.doc_settings and self.ui.doc_settings:readSetting("charcards")
     if type(data) ~= "table" then data = {} end
     return data
 end
 
 local function saveCards(self, cards)
-    if not self.ui.doc_settings then return end
-    self.ui.doc_settings:saveSetting("charcards", cards)
-    self.ui.doc_settings:flush()
+    local series_id = getSeriesId(self)
+    if series_id then
+        local s = getSeriesFile(series_id)
+        s:saveSetting("cards", cards)
+        s:flush()
+    elseif self.ui.doc_settings then
+        self.ui.doc_settings:saveSetting("charcards", cards)
+        self.ui.doc_settings:flush()
+    else
+        return
+    end
     if self._scheduleRescan then self:_scheduleRescan() end
 end
 
@@ -1047,7 +1153,7 @@ function CharCards:_saveUnderlineCache(sig)
     self.ui.doc_settings:flush()
 end
 
-function CharCards:scanForCharacters(force)
+function CharCards:scanForCharacters(force, silent)
     if G_reader_settings:readSetting(SETTING_UNDERLINE_ON) ~= true then
         self:clearUnderlines()
         return
@@ -1102,7 +1208,9 @@ function CharCards:scanForCharacters(force)
             plugin._cc_by_page = buildMatchesByPage(plugin, doc, xp_matches)
             plugin._cc_box_sig = nil
             log("scanForCharacters: " .. #xp_matches .. " згадувань")
-            UIManager:show(InfoMessage:new{ text = #xp_matches .. " згадувань персонажів знайдено", timeout = 3 })
+            if not silent then
+                UIManager:show(InfoMessage:new{ text = #xp_matches .. " згадувань персонажів знайдено", timeout = 3 })
+            end
             if plugin.ui.view then
                 if plugin.ui.view.dialog then UIManager:setDirty(plugin.ui.view.dialog, "ui") end
                 UIManager:setDirty(nil, "ui")
@@ -1132,7 +1240,9 @@ function CharCards:scanForCharacters(force)
         UIManager:scheduleIn(0, step)
     end
 
-    UIManager:show(InfoMessage:new{ text = "Сканую книгу на персонажів…", timeout = 2 })
+    if not silent then
+        UIManager:show(InfoMessage:new{ text = "Сканую книгу на персонажів…", timeout = 2 })
+    end
     UIManager:scheduleIn(0, step)
 end
 
@@ -1142,7 +1252,11 @@ function CharCards:_scheduleRescan()
     local plugin = self
     self._cc_rescan_fn = function()
         if plugin.destroyed then return end
-        plugin:scanForCharacters(true)
+        -- silent=true: це фонове автоперескання після кожного збереження
+        -- (додав/оновив персонажа), не ручний запуск з меню — тож без
+        -- "Сканую..."/"N знайдено" повідомлень, які раніше переривали потік
+        -- після кожної дрібної правки.
+        plugin:scanForCharacters(true, true)
     end
     UIManager:scheduleIn(1.5, self._cc_rescan_fn)
 end
@@ -1164,6 +1278,16 @@ function CharCards:addToMainMenu(menu_items)
                 end,
                 keep_menu_open = true,
                 callback = function() self_ref:showApiKeyDialog() end,
+            },
+            {
+                text_func = function()
+                    local series_id = getSeriesId(self_ref)
+                    if not series_id then return "Серія книг (не прив'язано)" end
+                    local name = getSeriesFile(series_id):readSetting("name") or series_id
+                    return "Серія книг: " .. name
+                end,
+                keep_menu_open = true,
+                callback = function() self_ref:showSeriesMenu() end,
             },
             {
                 text = "Підкреслення персонажів у тексті",
@@ -1260,6 +1384,160 @@ function CharCards:showApiKeyDialog()
     }
     UIManager:show(dialog)
     dialog:onShowKeyboard()
+end
+
+-- ===== Серія книг =====
+
+function CharCards:showSeriesMenu()
+    local self_ref = self
+    local series_id = getSeriesId(self)
+    local items = {}
+
+    if series_id then
+        local s = getSeriesFile(series_id)
+        local name = s:readSetting("name") or series_id
+        local n_cards = #loadCards(self)
+        table.insert(items, {
+            text = "Ця книга прив'язана до серії «" .. name .. "» (" .. n_cards .. " персонаж(ів))",
+            callback = function() end,
+        })
+        table.insert(items, {
+            text = "Відв'язати від серії",
+            keep_menu_open = false,
+            callback = function()
+                UIManager:show(ConfirmBox:new{
+                    text = "Відв'язати цю книгу від серії «" .. name .. "»?\n\n" ..
+                           "Персонажі серії нікуди не зникнуть — вони й далі доступні " ..
+                           "з будь-якої іншої книги, привʼязаної до цієї серії. Ця книга " ..
+                           "просто повернеться до власного, окремого списку персонажів " ..
+                           "(того, що був до привʼязки).",
+                    ok_text = "Відв'язати",
+                    ok_callback = function()
+                        setSeriesId(self_ref, nil)
+                        self_ref:clearUnderlines()
+                        UIManager:show(InfoMessage:new{ text = "Відв'язано від серії.", timeout = 2 })
+                    end,
+                })
+            end,
+        })
+    else
+        table.insert(items, {
+            text = "Прив'язати до існуючої серії",
+            callback = function() self_ref:showLinkToSeriesPicker() end,
+        })
+        table.insert(items, {
+            text = "Створити нову серію й привʼязати цю книгу",
+            callback = function() self_ref:showCreateSeriesDialog() end,
+        })
+    end
+
+    UIManager:show(Menu:new{
+        title       = "Серія книг",
+        item_table  = items,
+        width       = Screen:getWidth(),
+        show_parent = self.ui,
+    })
+end
+
+function CharCards:showLinkToSeriesPicker()
+    local self_ref = self
+    local series_list = listSeries()
+    if #series_list == 0 then
+        UIManager:show(InfoMessage:new{
+            text = "Ще немає жодної серії. Спершу створи нову — «Серія книг → Створити нову серію».",
+            timeout = 4,
+        })
+        return
+    end
+    local items = {}
+    for _, s in ipairs(series_list) do
+        table.insert(items, {
+            text     = s.name,
+            callback = function() self_ref:_linkToSeries(s.id, s.name) end,
+        })
+    end
+    UIManager:show(Menu:new{
+        title       = "Обери серію",
+        item_table  = items,
+        width       = Screen:getWidth(),
+        show_parent = self.ui,
+    })
+end
+
+function CharCards:showCreateSeriesDialog()
+    local self_ref = self
+    local dialog
+    dialog = InputDialog:new{
+        title      = "Назва серії",
+        input      = "",
+        input_hint = "напр. Талісман",
+        buttons    = {{
+            { text = "Скасувати", callback = function() UIManager:close(dialog) end },
+            {
+                text             = "Створити",
+                is_enter_default = true,
+                callback         = function()
+                    local name = trim(dialog:getInputText() or "")
+                    UIManager:close(dialog)
+                    if name == "" then return end
+                    -- унікальний id (назва + час створення) — дві серії з однаковою
+                    -- назвою не зіллються випадково в один файл
+                    local id = sanitizeSeriesId(name) .. "_" .. tostring(os.time())
+                    local s = getSeriesFile(id)
+                    s:saveSetting("name", name)
+                    s:flush()
+                    self_ref:_linkToSeries(id, name)
+                end,
+            },
+        }},
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+-- Привʼязує поточну книгу до серії. Якщо в книги вже були власні картки
+-- (набрані до привʼязки) — переносить їх у спільний пул серії, обʼєднуючи
+-- з уже наявними там персонажами тим самим принципом, що й "Додати до
+-- персонажа" (нічого не втрачається, максимум зрідка здублюється фраза).
+function CharCards:_linkToSeries(series_id, series_name)
+    local self_ref = self
+    local local_cards = self.ui.doc_settings and self.ui.doc_settings:readSetting("charcards")
+    if type(local_cards) ~= "table" then local_cards = {} end
+
+    setSeriesId(self, series_id)
+
+    if #local_cards > 0 then
+        local series_cards = loadCards(self)
+        local added, merged = 0, 0
+        for _, lc in ipairs(local_cards) do
+            local existing = findCardByName(series_cards, lc.name)
+            if existing then
+                mergeUpdateIntoCard(existing, lc)
+                merged = merged + 1
+            else
+                table.insert(series_cards, lc)
+                added = added + 1
+            end
+        end
+        saveCards(self, series_cards)
+        UIManager:show(InfoMessage:new{
+            text = "Привʼязано до серії «" .. series_name .. "». Додано " .. added ..
+                   " нових персонажів, обʼєднано з наявними: " .. merged .. ".",
+            timeout = 4,
+        })
+    else
+        UIManager:show(InfoMessage:new{
+            text = "Привʼязано до серії «" .. series_name .. "».",
+            timeout = 3,
+        })
+    end
+
+    self_ref:clearUnderlines()
+    if G_reader_settings:readSetting(SETTING_UNDERLINE_ON) == true then
+        -- silent: тут уже є своє інформативне повідомлення про підсумки
+        -- привʼязки вище, зайвий "Сканую.../N знайдено" був би надлишковим
+        self_ref:scanForCharacters(true, true)
+    end
 end
 
 -- ===== Дія 1: додати нового персонажа за виділеним ім'ям =====
@@ -1411,8 +1689,11 @@ function CharCards:_submitFact(card, quote)
             "Бекграунд: " .. (card.background ~= "" and card.background or "невідомо") .. "\n\n" ..
             "З цитати визнач, яку НОВУ інформацію вона додає до картки цього персонажа. " ..
             "Формулюй кожне поле своїми словами (не переписуй цитату дослівно), максимум одне-два " ..
-            "коротких речення на поле. Якщо цитата не дає нічого нового для якогось поля — лиши " ..
-            "його порожнім (не повторюй те, що вже є в картці вище).\n\n" ..
+            "коротких речення на поле. Якщо цитата не дає нічого СУТТЄВО нового для якогось поля — " ..
+            "лиши його порожнім. Це стосується і повторів іншими словами: якщо в полі вже записано " ..
+            "«лисий», а цитата підказує «з лисою головою» чи «блищала лисина» — це ТА САМА " ..
+            "інформація, а не нова, тому поле лишається порожнім. Нове — лише те, чого в записаному " ..
+            "тексті ще немає ЗА ЗМІСТОМ, а не лише за буквальним текстом.\n\n" ..
             "Формат відповіді — СУВОРО лише JSON, без пояснень і без ```:\n" ..
             '{\n' ..
             '  "occupation": "нова інформація про рід занять, або порожній рядок",\n' ..
