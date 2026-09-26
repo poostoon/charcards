@@ -92,16 +92,17 @@ Existing character data is not lost when a book is linked to a series. If the bo
 
 Copy the `charcards.koplugin` folder to:
 
-
+```text
 /koreader/plugins/
-
+```
 
 The folder should contain at least:
 
-
+```text
 charcards.koplugin/
 ├── _meta.lua
 └── main.lua
+```
 
 Restart KOReader.
 
