@@ -181,7 +181,11 @@ userpatch.registerPatchPluginFunc("charcards", function(CharCardsClass)
         "Update the card using the quote above. For the fields \"occupation\", \"physical_description\", " ..
         "\"personality\", \"background\" return the FULL desired value of the field (not just the new " ..
         "fragment!) — combine what's already recorded above with what the quote adds, concisely, in " ..
-        "your own words, without duplicating MEANING. If the quote suggests the same thing that's " ..
+        "your own words, without duplicating MEANING. The same applies to \"relationships\" — return " ..
+        "the FULL list of this character's relationships (already known + new from the quote), merging " ..
+        "entries that mean the same thing into one (for example, \"the king's daughter\" and \"daughter " ..
+        "of the former king\" are the same relationship — keep only one, pick the better phrasing). If " ..
+        "the quote suggests the same thing that's " ..
         "already recorded, just in different words (for example, the field already says \"bald\", and " ..
         "the quote says \"a bald head\" or \"no hair\") — that's the SAME THING, mark it only ONCE, " ..
         "pick the better phrasing, don't write both. If the quote adds nothing at all for some field — " ..
@@ -194,7 +198,7 @@ userpatch.registerPatchPluginFunc("charcards", function(CharCardsClass)
         '  "physical_description": "full updated value of the field (or the current value unchanged, or empty)",\n' ..
         '  "personality": "full updated value of the field AS AN INFERENCE from how the character acts/speaks (not a recap of events), or the current value unchanged, or empty",\n' ..
         '  "aliases": ["a new name/nickname, if the quote reveals one"],\n' ..
-        '  "relationships": ["a new relationship to someone, if there is one in the quote — always in the form \'this character is [someone] relative to [someone else]\' (e.g. \'the king\'s daughter\', not \'her father is the king\')"],\n' ..
+        '  "relationships": ["FULL list of relationships (old+new merged, deduplicated by meaning) — each always in the form \'this character is [someone] relative to [someone else]\' (e.g. \'the king\'s daughter\', not \'her father is the king\')"],\n' ..
         '  "standout_trait": "ONLY if this quote shows something more noticeable/distinctive than what\'s already recorded above — a new standout trait, otherwise an empty string",\n' ..
         '  "background": "full updated value of the field (or the current value unchanged, or empty)"\n' ..
         '}'
