@@ -20,10 +20,12 @@
 -- прив'язана до серії — замість сайдкара книги картки читаються/пишуться
 -- у спільний файл серії (DataStorage:getDataDir() .. "/charcards_series/").
 --
--- Схема картки (поля як у KoCharacters, для звичного вигляду):
---   { id, name, aliases[], role, occupation, physical_description,
---     personality, relationships[], background, relation_to_protagonist,
---     standout_trait }
+-- Схема картки:
+--   { id, name, aliases[], occupation, physical_description,
+--     personality, relationships[], background, standout_trait }
+-- (роль і окремий "звʼязок з головним персонажем" навмисно прибрані —
+-- роль AI визначала ненадійно (фальс-аларми), а звʼязки з іншими
+-- персонажами вже покриваються полем relationships)
 
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local UIManager        = require("ui/uimanager")
@@ -504,6 +506,42 @@ end
 
 -- ===== Зберігання карток (сайдкар книги — або спільний файл серії, якщо привʼязано) =====
 
+-- Підпис набору персонажів (імена+псевдоніми) — використовується і для
+-- кешу підкреслень, і тут, щоб зрозуміти, чи saveCards() реально додав/
+-- прибрав якесь ІМʼЯ (а не просто оновив поле в уже наявного персонажа).
+local function cardsSignature(cards)
+    local parts = {}
+    for _, c in ipairs(cards) do
+        table.insert(parts, c.name or "")
+        if c.aliases then for _, a in ipairs(c.aliases) do table.insert(parts, a) end end
+    end
+    return table.concat(parts, "|")
+end
+
+-- Які саме імена/псевдоніми є в new_cards, але не було в old_cards — щоб
+-- пересканувати книгу на предмет ЛИШЕ нового імені, а не всіх персонажів
+-- заново (позиції вже відомих персонажів і так лежать у кеші).
+local function newTermsSince(old_cards, new_cards)
+    local old_set = {}
+    for _, c in ipairs(old_cards) do
+        if c.name then old_set[trim(c.name)] = true end
+        if c.aliases then for _, a in ipairs(c.aliases) do old_set[trim(a)] = true end end
+    end
+    local new_terms = {}
+    for _, c in ipairs(new_cards) do
+        local names = { c.name }
+        if c.aliases then for _, a in ipairs(c.aliases) do table.insert(names, a) end end
+        for _, n in ipairs(names) do
+            local clean = trim(n)
+            if #clean >= 3 and not old_set[clean] then
+                table.insert(new_terms, clean)
+                old_set[clean] = true  -- уникнути дублів у самому new_terms
+            end
+        end
+    end
+    return new_terms
+end
+
 local function loadCards(self)
     local series_id = getSeriesId(self)
     if series_id then
@@ -516,7 +554,16 @@ local function loadCards(self)
     return data
 end
 
+-- Пересканування (і, відповідно, підкреслення) запускаємо ЛИШЕ якщо набір
+-- імен/псевдонімів справді змінився — новий персонаж чи нове ім'я для вже
+-- наявного. Просте оновлення поля (характер, звʼязки тощо) на пошук у
+-- тексті ніяк не впливає, тож і сканувати книгу заново нема сенсу.
 local function saveCards(self, cards)
+    local old_cards = loadCards(self)
+    local old_sig = cardsSignature(old_cards)
+    local new_sig = cardsSignature(cards)
+    local new_terms = (old_sig ~= new_sig) and newTermsSince(old_cards, cards) or nil
+
     local series_id = getSeriesId(self)
     if series_id then
         local s = getSeriesFile(series_id)
@@ -528,7 +575,10 @@ local function saveCards(self, cards)
     else
         return
     end
-    if self._scheduleRescan then self:_scheduleRescan() end
+
+    if new_terms and self._scheduleRescan then
+        self:_scheduleRescan(new_terms)
+    end
 end
 
 local function findCardByName(cards, name)
@@ -546,17 +596,11 @@ end
 
 -- ===== Поля картки: підписи й логіка домішування нової інформації =====
 
-local ROLE_LABELS = {
-    protagonist = "Головний персонаж",
-    antagonist  = "Антагоніст",
-    supporting  = "Другорядний персонаж",
-}
-local VALID_ROLES = { protagonist = true, antagonist = true, supporting = true, unknown = true }
-
--- Дописує нове значення до текстового поля (occupation/physical_description/
--- personality), лише якщо його там ще немає (проста підрядкова перевірка,
--- регістронезалежна щодо кирилиці) — так поле накопичується, а не втрачає
--- вже відоме при кожному новому уривку.
+-- Дописує нове значення до текстового поля, лише якщо його там ще немає
+-- (проста підрядкова перевірка, регістронезалежна щодо кирилиці) — так
+-- поле накопичується, а не втрачає вже відоме. Використовується ЛИШЕ для
+-- об'єднання двох уже повних карток (привʼязка до серії, дивись нижче) —
+-- там нема іншого проходу AI, який міг би переписати текст начисто.
 local function mergeTextField(existing, new_value)
     new_value = trim(new_value or "")
     if new_value == "" then return existing, false end
@@ -587,23 +631,28 @@ local function mergeArrayField(existing, new_items)
     return existing, added
 end
 
--- Застосовує частковий JSON-результат від Gemini (для "Додати до персонажа")
--- до картки: кожне поле оновлюється своєю логікою, повертає список підписів
--- полів, які реально змінились (для повідомлення користувачу).
+-- Застосовує результат Gemini для "Додати до персонажа": для текстових
+-- полів (рід занять/зовнішність/характер/бекграунд) Gemini бачить старий
+-- текст ЦІЛКОМ і повертає вже готове, повністю переформульоване значення
+-- поля — тому тут просто ВСТАНОВЛЮЄМО його, а не дописуємо. Так вона сама
+-- прибирає повтори ЗМІСТОМ ("лисий" / "без волосся" / "з лисою головою" —
+-- одне й те саме), а не лише дослівні збіги, які раніше ловив підрядковий
+-- пошук. Списки (псевдоніми/звʼязки) і найхарактерніша риса — без змін.
 local function mergeUpdateIntoCard(card, update)
     local changed = {}
 
-    local new_occ, occ_changed = mergeTextField(card.occupation, update.occupation)
-    card.occupation = new_occ
-    if occ_changed then table.insert(changed, "рід занять") end
+    local function setTextField(field, label)
+        local new_value = trim(update[field] or "")
+        if new_value == "" then return end
+        if ukLower(new_value) == ukLower(card[field] or "") then return end
+        card[field] = new_value
+        table.insert(changed, label)
+    end
 
-    local new_phys, phys_changed = mergeTextField(card.physical_description, update.physical_description)
-    card.physical_description = new_phys
-    if phys_changed then table.insert(changed, "зовнішність") end
-
-    local new_pers, pers_changed = mergeTextField(card.personality, update.personality)
-    card.personality = new_pers
-    if pers_changed then table.insert(changed, "характер") end
+    setTextField("occupation", "рід занять")
+    setTextField("physical_description", "зовнішність")
+    setTextField("personality", "характер")
+    setTextField("background", "бекграунд")
 
     local new_aliases, aliases_changed = mergeArrayField(card.aliases, update.aliases)
     card.aliases = new_aliases
@@ -613,16 +662,7 @@ local function mergeUpdateIntoCard(card, update)
     card.relationships = new_rel
     if rel_changed then table.insert(changed, "звʼязки") end
 
-    local new_bg, bg_changed = mergeTextField(card.background, update.background)
-    card.background = new_bg
-    if bg_changed then table.insert(changed, "бекграунд") end
-
-    local new_relprot, relprot_changed = mergeTextField(card.relation_to_protagonist, update.relation_to_protagonist)
-    card.relation_to_protagonist = new_relprot
-    if relprot_changed then table.insert(changed, "звʼязок з головним персонажем") end
-
     -- standout_trait — це "НАЙхарактерніша" риса, одна, а не список, тому
-    -- не дописуємо через mergeTextField (це дало б купу рис поспіль), а
     -- перезаписуємо, коли Gemini впевнено пропонує нову — вважаємо, що
     -- пізніший аналіз має більше контексту й обирає влучніше.
     if type(update.standout_trait) == "string" and trim(update.standout_trait) ~= "" then
@@ -633,34 +673,91 @@ local function mergeUpdateIntoCard(card, update)
         end
     end
 
-    -- Роль оновлюємо лише якщо ще не визначена — щоб короткий уривок не
-    -- перезаписував уже усталену роль з попереднього, повнішого контексту.
-    if (card.role == nil or card.role == "" or card.role == "unknown")
-       and type(update.role) == "string" and VALID_ROLES[update.role] and update.role ~= "unknown" then
-        card.role = update.role
-        table.insert(changed, "роль")
+    return changed
+end
+
+-- Об'єднує дві вже ПОВНІ картки того самого персонажа з різних книг серії
+-- (привʼязка до серії, дивись CharCards:_linkToSeries) — тут нема проходу
+-- AI, який міг би переписати текст, тож для текстових полів лишається
+-- стара, консервативніша логіка "дописати, якщо це справді нове".
+local function combineCardsForSeries(existing, incoming)
+    local changed = {}
+
+    local new_occ, occ_changed = mergeTextField(existing.occupation, incoming.occupation)
+    existing.occupation = new_occ
+    if occ_changed then table.insert(changed, "рід занять") end
+
+    local new_phys, phys_changed = mergeTextField(existing.physical_description, incoming.physical_description)
+    existing.physical_description = new_phys
+    if phys_changed then table.insert(changed, "зовнішність") end
+
+    local new_pers, pers_changed = mergeTextField(existing.personality, incoming.personality)
+    existing.personality = new_pers
+    if pers_changed then table.insert(changed, "характер") end
+
+    local new_bg, bg_changed = mergeTextField(existing.background, incoming.background)
+    existing.background = new_bg
+    if bg_changed then table.insert(changed, "бекграунд") end
+
+    local new_aliases, aliases_changed = mergeArrayField(existing.aliases, incoming.aliases)
+    existing.aliases = new_aliases
+    if aliases_changed then table.insert(changed, "інші імена") end
+
+    local new_rel, rel_changed = mergeArrayField(existing.relationships, incoming.relationships)
+    existing.relationships = new_rel
+    if rel_changed then table.insert(changed, "звʼязки") end
+
+    if type(incoming.standout_trait) == "string" and trim(incoming.standout_trait) ~= "" then
+        local new_trait = trim(incoming.standout_trait)
+        if ukLower(new_trait) ~= ukLower(existing.standout_trait or "") then
+            existing.standout_trait = new_trait
+            table.insert(changed, "характерна риса")
+        end
     end
 
     return changed
 end
 
 -- Компактна картка для попапу при тапу на підкреслене ім'я в тексті:
--- роль, звʼязок із головним персонажем, найхарактерніша риса, бекграунд.
--- Навмисно коротша за formatCardText — це швидкий погляд, не повний профіль.
+-- короткий витяг з роду занять, звʼязків, найхарактерніша риса й
+-- бекграунд. Навмисно коротша за formatCardText — це швидкий погляд,
+-- не повний профіль (звʼязки обрізаються до перших двох, довгі поля —
+-- до ~150 символів).
+-- Стискає текст до max_len символів (по кодовим точкам UTF-8, не байтах,
+-- щоб не розрізати кириличний символ навпіл) з "…" в кінці за потреби.
+local function truncateForCompact(text, max_len)
+    if not text or text == "" then return text end
+    local chars, count = {}, 0
+    for ch in text:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+        count = count + 1
+        if count > max_len then
+            return table.concat(chars) .. "…"
+        end
+        table.insert(chars, ch)
+    end
+    return text
+end
+
 local function formatCompactCardText(card)
     local lines = {}
-    if card.role and ROLE_LABELS[card.role] then
-        table.insert(lines, ROLE_LABELS[card.role])
+    if card.occupation and card.occupation ~= "" then
+        table.insert(lines, truncateForCompact(card.occupation, 100))
     end
-    if card.relation_to_protagonist and card.relation_to_protagonist ~= "" then
-        table.insert(lines, card.relation_to_protagonist)
+    if card.relationships and #card.relationships > 0 then
+        local preview = {}
+        for i = 1, math.min(2, #card.relationships) do
+            table.insert(preview, card.relationships[i])
+        end
+        local rel_line = table.concat(preview, "; ")
+        if #card.relationships > 2 then rel_line = rel_line .. "…" end
+        table.insert(lines, rel_line)
     end
     if card.standout_trait and card.standout_trait ~= "" then
         table.insert(lines, card.standout_trait)
     end
     if card.background and card.background ~= "" then
         if #lines > 0 then table.insert(lines, "") end
-        table.insert(lines, card.background)
+        table.insert(lines, truncateForCompact(card.background, 150))
     end
     if #lines == 0 then
         table.insert(lines, "Даних поки нема.")
@@ -671,10 +768,6 @@ end
 -- Текстове представлення картки для перегляду (TextViewer).
 local function formatCardText(card)
     local lines = {}
-    if card.role and ROLE_LABELS[card.role] then
-        table.insert(lines, ROLE_LABELS[card.role])
-        table.insert(lines, "")
-    end
     if card.aliases and #card.aliases > 0 then
         table.insert(lines, "Інші імена: " .. table.concat(card.aliases, ", "))
     end
@@ -701,14 +794,8 @@ local function formatCardText(card)
         end
         table.insert(lines, "")
     end
-    if card.relation_to_protagonist and card.relation_to_protagonist ~= "" then
-        table.insert(lines, "Звʼязок з головним персонажем: " .. card.relation_to_protagonist)
-    end
     if card.standout_trait and card.standout_trait ~= "" then
         table.insert(lines, "Найхарактерніше: " .. card.standout_trait)
-    end
-    if (card.relation_to_protagonist and card.relation_to_protagonist ~= "")
-       or (card.standout_trait and card.standout_trait ~= "") then
         table.insert(lines, "")
     end
     if card.background and card.background ~= "" then
@@ -730,7 +817,7 @@ end
 -- як зависання.
 
 local MIN_TERM_LEN  = 3
-local MAX_REGEX_LEN = 3000
+local MAX_REGEX_LEN = 600
 
 local function escapeRegex(s)
     local esc = s:gsub("([%^%$%.%*%+%?%(%)%[%]%{%}|\\])", "\\%1")
@@ -828,15 +915,6 @@ local function cacheSig(self)
     if doc.getDocumentRenderingHash then pcall(function() hash = doc:getDocumentRenderingHash() end) end
     local sw, sh = Screen:getWidth(), Screen:getHeight()
     return table.concat({ tostring(page), tostring(pos), tostring(hash), tostring(sw), tostring(sh) }, "|")
-end
-
-local function cardsSignature(cards)
-    local parts = {}
-    for _, c in ipairs(cards) do
-        table.insert(parts, c.name or "")
-        if c.aliases then for _, a in ipairs(c.aliases) do table.insert(parts, a) end end
-    end
-    return table.concat(parts, "|")
 end
 
 -- ===== Компактний попап (той самий перевірений шаблон: OverlapGroup,
@@ -1237,28 +1315,122 @@ function CharCards:scanForCharacters(force, silent)
         else
             log("findAllText не вдався, чанк=" .. idx .. "/" .. #patterns)
         end
-        UIManager:scheduleIn(0, step)
+        -- Невелика (не нульова) пауза між шматками — не просто повертає
+        -- керування в той самий такт подій, а справді дає KOReader шанс
+        -- обробити гортання сторінки чи тап, перш ніж брати наступний
+        -- шматок регексу. Разом з меншим MAX_REGEX_LEN вище (600 замість
+        -- 3000 — тобто вп'ятеро більше, вп'ятеро коротших шматків) кожен
+        -- окремий "гальм" стає значно менш помітним під час читання.
+        UIManager:scheduleIn(0.02, step)
     end
 
     if not silent then
         UIManager:show(InfoMessage:new{ text = "Сканую книгу на персонажів…", timeout = 2 })
     end
-    UIManager:scheduleIn(0, step)
+    UIManager:scheduleIn(0.02, step)
 end
 
-function CharCards:_scheduleRescan()
+function CharCards:_scheduleRescan(new_terms)
     if G_reader_settings:readSetting(SETTING_UNDERLINE_ON) ~= true then return end
+
+    -- Накопичуємо нові терміни, якщо кілька збережень трапляються швидко
+    -- одне за одним (кілька правок поспіль) — усі знайдуться одним заходом.
+    if new_terms and #new_terms > 0 then
+        self._cc_pending_new_terms = self._cc_pending_new_terms or {}
+        for _, t in ipairs(new_terms) do table.insert(self._cc_pending_new_terms, t) end
+    end
+
     if self._cc_rescan_fn then UIManager:unschedule(self._cc_rescan_fn) end
     local plugin = self
     self._cc_rescan_fn = function()
         if plugin.destroyed then return end
-        -- silent=true: це фонове автоперескання після кожного збереження
-        -- (додав/оновив персонажа), не ручний запуск з меню — тож без
-        -- "Сканую..."/"N знайдено" повідомлень, які раніше переривали потік
-        -- після кожної дрібної правки.
-        plugin:scanForCharacters(true, true)
+        local pending = plugin._cc_pending_new_terms
+        plugin._cc_pending_new_terms = nil
+        -- silent=true / інкрементальний скан: це фонове автоперескання
+        -- після збереження (додав/оновив персонажа), не ручний запуск з
+        -- меню — тож без "Сканую.../N знайдено" повідомлень, і, коли
+        -- можливо, шукаємо ЛИШЕ нові імена (позиції вже відомих персонажів
+        -- і так є в кеші, наново їх шукати по всій книзі нема сенсу).
+        if pending and #pending > 0 and plugin._cc_xp_matches then
+            plugin:_incrementalScan(pending)
+        else
+            plugin:scanForCharacters(true, true)
+        end
     end
     UIManager:scheduleIn(1.5, self._cc_rescan_fn)
+end
+
+-- Сканує книгу лише на задані терміни (нові імена/псевдоніми) й ДОДАЄ
+-- знайдене до вже наявного кешу позицій, замість перебудовувати все з нуля.
+-- Використовує ту саму чанковану findAllText-логіку, що й повний скан.
+function CharCards:_incrementalScan(new_terms)
+    if self._cc_scan_in_progress then return end  -- щось інше вже сканує — не заважаємо
+    local doc = self.ui and self.ui.document
+    if not doc or not doc.findAllText then return end
+
+    local lookup = {}
+    for _, c in ipairs(loadCards(self)) do
+        if c.name then lookup[trim(c.name)] = c end
+        if c.aliases then for _, a in ipairs(c.aliases) do lookup[trim(a)] = c end end
+    end
+
+    local patterns = buildUnderlineChunks(new_terms)
+    local hits = {}
+    local idx = 0
+    local plugin = self
+
+    local function finishIncremental()
+        local ok_f, err_f = pcall(function()
+            local unique = {}
+            for _, h in ipairs(hits) do
+                local e = h["end"]
+                if not unique[e] or #h.matched_text > #unique[e].matched_text then unique[e] = h end
+            end
+            local added = 0
+            plugin._cc_xp_matches = plugin._cc_xp_matches or {}
+            for _, h in pairs(unique) do
+                local matched = trim(h.matched_text or "")
+                local entity = lookup[matched]
+                if entity then
+                    table.insert(plugin._cc_xp_matches, { start_xp = h.start, end_xp = h["end"], entity_name = entity.name })
+                    added = added + 1
+                end
+            end
+            plugin._cc_by_page = buildMatchesByPage(plugin, doc, plugin._cc_xp_matches)
+            plugin._cc_box_sig = nil
+            log("incrementalScan: +" .. added .. " нових згадувань")
+            if plugin.ui.view then
+                if plugin.ui.view.dialog then UIManager:setDirty(plugin.ui.view.dialog, "ui") end
+                UIManager:setDirty(nil, "ui")
+            end
+            local sig = cardsSignature(loadCards(plugin))
+            UIManager:scheduleIn(0.5, function()
+                if not plugin.destroyed then plugin:_saveUnderlineCache(sig) end
+            end)
+        end)
+        plugin._cc_scan_in_progress = false
+        if not ok_f then log("incrementalScan помilka: " .. tostring(err_f)) end
+    end
+
+    local function step()
+        if plugin.destroyed or not plugin.ui or not plugin.ui.document then
+            plugin._cc_scan_in_progress = false
+            return
+        end
+        idx = idx + 1
+        local pat = patterns[idx]
+        if not pat then finishIncremental(); return end
+        local ok1, hits1 = pcall(function() return doc:findAllText(pat, false, 0, 5000, true) end)
+        if ok1 and hits1 then
+            for _, h in ipairs(hits1) do table.insert(hits, h) end
+        else
+            log("findAllText (інкремент) не вдався, чанк=" .. idx .. "/" .. #patterns)
+        end
+        UIManager:scheduleIn(0.02, step)
+    end
+
+    self._cc_scan_in_progress = true
+    UIManager:scheduleIn(0.02, step)
 end
 
 function CharCards:addToMainMenu(menu_items)
@@ -1512,7 +1684,7 @@ function CharCards:_linkToSeries(series_id, series_name)
         for _, lc in ipairs(local_cards) do
             local existing = findCardByName(series_cards, lc.name)
             if existing then
-                mergeUpdateIntoCard(existing, lc)
+                combineCardsForSeries(existing, lc)
                 merged = merged + 1
             else
                 table.insert(series_cards, lc)
@@ -1582,9 +1754,7 @@ function CharCards:onAddNewCharacter(name)
             '  "occupation": "рід занять/статус (наприклад: коваль, вітчим Джека, власник компанії) — порожній рядок якщо невідомо",\n' ..
             '  "physical_description": "зовнішність ЛИШЕ якщо явно описана в тексті, інакше порожній рядок",\n' ..
             '  "personality": "стабільні риси характеру, зроблені висновком із того, як він діє/говорить (не переказ подій) — порожній рядок якщо не видно",\n' ..
-            '  "role": "protagonist, antagonist, supporting або unknown — на основі того, як він поданий у цьому уривку",\n' ..
-            '  "relationships": ["стосунок до інших персонажів, якщо згадано, напр. \'вітчим Джека\', \'ворог Спіді\'"],\n' ..
-            '  "relation_to_protagonist": "одним коротким реченням — як цей персонаж повʼязаний з головним героєм книги, або порожній рядок якщо незрозуміло чи він і є головним героєм",\n' ..
+            '  "relationships": ["ХТО ЦЕЙ ПЕРСОНАЖ для іншої людини — завжди в такому напрямку: \'донька короля\', \'вітчим Джека\', \'ворог Спіді\'. НІКОЛИ не описуй у зворотному напрямку (не \'батько — король\', а \'донька короля\')."],\n' ..
             '  "standout_trait": "ОДНА найпомітніша, найхарактерніша риса — зовнішня чи поведінкова, те, за чим його одразу впізнати — або порожній рядок",\n' ..
             '  "background": "коротка передісторія/походження персонажа, якщо згадано в уривку (звідки він, що з ним було раніше) — інакше порожній рядок"\n' ..
             '}'
@@ -1594,9 +1764,6 @@ function CharCards:onAddNewCharacter(name)
             UIManager:show(InfoMessage:new{ text = "Gemini: " .. tostring(err) })
             return
         end
-
-        local role = type(result.role) == "string" and result.role or "unknown"
-        if not VALID_ROLES[role] then role = "unknown" end
 
         local aliases = {}
         if type(result.aliases) == "table" then
@@ -1617,13 +1784,11 @@ function CharCards:onAddNewCharacter(name)
             id                       = tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999)),
             name                     = name,
             aliases                  = aliases,
-            role                     = role,
             occupation               = type(result.occupation) == "string" and trim(result.occupation) or "",
             physical_description     = type(result.physical_description) == "string" and trim(result.physical_description) or "",
             personality              = type(result.personality) == "string" and trim(result.personality) or "",
             relationships            = relationships,
             background               = type(result.background) == "string" and trim(result.background) or "",
-            relation_to_protagonist  = type(result.relation_to_protagonist) == "string" and trim(result.relation_to_protagonist) or "",
             standout_trait           = type(result.standout_trait) == "string" and trim(result.standout_trait) or "",
         }
 
@@ -1655,7 +1820,7 @@ function CharCards:onAddFactToCharacter(quote)
     local items = {}
     for _, c in ipairs(cards) do
         table.insert(items, {
-            text     = c.name .. (ROLE_LABELS[c.role] and ("  [" .. ROLE_LABELS[c.role] .. "]") or ""),
+            text     = c.name,
             callback = function()
                 self_ref:_submitFact(c, quote)
             end,
@@ -1684,27 +1849,27 @@ function CharCards:_submitFact(card, quote)
             "Зовнішність: " .. (card.physical_description ~= "" and card.physical_description or "невідомо") .. "\n" ..
             "Характер: " .. (card.personality ~= "" and card.personality or "невідомо") .. "\n" ..
             "Звʼязки: " .. (#card.relationships > 0 and table.concat(card.relationships, "; ") or "невідомо") .. "\n" ..
-            "Звʼязок з головним персонажем: " .. (card.relation_to_protagonist ~= "" and card.relation_to_protagonist or "невідомо") .. "\n" ..
             "Найхарактерніша риса: " .. (card.standout_trait ~= "" and card.standout_trait or "невідомо") .. "\n" ..
             "Бекграунд: " .. (card.background ~= "" and card.background or "невідомо") .. "\n\n" ..
-            "З цитати визнач, яку НОВУ інформацію вона додає до картки цього персонажа. " ..
-            "Формулюй кожне поле своїми словами (не переписуй цитату дослівно), максимум одне-два " ..
-            "коротких речення на поле. Якщо цитата не дає нічого СУТТЄВО нового для якогось поля — " ..
-            "лиши його порожнім. Це стосується і повторів іншими словами: якщо в полі вже записано " ..
-            "«лисий», а цитата підказує «з лисою головою» чи «блищала лисина» — це ТА САМА " ..
-            "інформація, а не нова, тому поле лишається порожнім. Нове — лише те, чого в записаному " ..
-            "тексті ще немає ЗА ЗМІСТОМ, а не лише за буквальним текстом.\n\n" ..
+            "Онови картку цитатою вище. Для полів \"occupation\", \"physical_description\", " ..
+            "\"personality\", \"background\" поверни ПОВНЕ бажане значення поля (не лише новий " ..
+            "шматок!) — об'єднай те, що вже записано вище, з тим, що дає цитата, стисло, своїми " ..
+            "словами, без дублювання ЗМІСТУ. Якщо цитата підказує те саме, що вже записано, лише " ..
+            "іншими словами (наприклад, у полі вже є «лисий», а цитата каже «з лисою головою» чи " ..
+            "«без волосся») — це ОДНЕ Й ТЕ САМЕ, познач так лише ОДИН раз, обери влучніше " ..
+            "формулювання, не пиши обидва. Якщо для якогось поля цитата взагалі нічого не додає — " ..
+            "поверни його ПОТОЧНЕ значення без змін (скопіюй те, що вище), а не порожній рядок — " ..
+            "порожній рядок лиши тільки якщо про це поле взагалі нічого не відомо ні зараз, ні з " ..
+            "цитати. Кожне поле — максимум 1-2 короткі речення, ніколи не переписуй цитату дослівно.\n\n" ..
             "Формат відповіді — СУВОРО лише JSON, без пояснень і без ```:\n" ..
             '{\n' ..
-            '  "occupation": "нова інформація про рід занять, або порожній рядок",\n' ..
-            '  "physical_description": "нова деталь зовнішності, або порожній рядок",\n' ..
-            '  "personality": "нова риса характеру ЯК ВИСНОВОК із цитати (не переказ дії), або порожній рядок",\n' ..
+            '  "occupation": "повне оновлене значення поля (або поточне без змін, або порожньо)",\n' ..
+            '  "physical_description": "повне оновлене значення поля (або поточне без змін, або порожньо)",\n' ..
+            '  "personality": "повне оновлене значення поля ЯК ВИСНОВОК із того, як персонаж діє/говорить (не переказ подій), або поточне без змін, або порожньо",\n' ..
             '  "aliases": ["нове ім\'я/прізвисько, якщо цитата його розкриває"],\n' ..
-            '  "relationships": ["новий стосунок до когось, якщо є в цитаті"],\n' ..
-            '  "relation_to_protagonist": "якщо цитата уточнює звʼязок із головним героєм — нове формулювання, інакше порожній рядок",\n' ..
+            '  "relationships": ["новий стосунок до когось, якщо є в цитаті — завжди у формі \'цей персонаж є [хтось] відносно [когось]\' (напр. \'донька короля\', не \'батько — король\')"],\n' ..
             '  "standout_trait": "ЛИШЕ якщо ця цитата показує щось помітніше/характерніше за те, що вже записано вище — нова найхарактерніша риса, інакше порожній рядок",\n' ..
-            '  "background": "нова інформація про передісторію/походження, якщо є в цитаті, інакше порожній рядок",\n' ..
-            '  "role": "protagonist/antagonist/supporting, ЛИШЕ якщо цитата явно це показує, інакше порожній рядок"\n' ..
+            '  "background": "повне оновлене значення поля (або поточне без змін, або порожньо)"\n' ..
             '}'
 
         local result, err = callGemini(api_key, prompt)
@@ -1748,13 +1913,11 @@ function CharCards:onEditCard(card)
             if c.id == card.id then
                 c.name                  = card.name
                 c.aliases               = card.aliases
-                c.role                  = card.role
                 c.occupation            = card.occupation
                 c.physical_description  = card.physical_description
                 c.personality           = card.personality
                 c.relationships         = card.relationships
                 c.background            = card.background
-                c.relation_to_protagonist = card.relation_to_protagonist
                 c.standout_trait        = card.standout_trait
                 break
             end
@@ -1798,36 +1961,6 @@ function CharCards:onEditCard(card)
                     editTextField("Ім'я", card.name, false, function(val)
                         if val ~= "" then card.name = val; save(); afterSave() end
                     end)
-                end,
-            },
-            {
-                text     = "Роль: " .. (ROLE_LABELS[card.role] or "Не визначено"),
-                callback = function()
-                    local role_menu
-                    local options = {
-                        { code = "unknown",     label = "Не визначено" },
-                        { code = "protagonist", label = "Головний персонаж" },
-                        { code = "antagonist",  label = "Антагоніст" },
-                        { code = "supporting",  label = "Другорядний персонаж" },
-                    }
-                    local role_items = {}
-                    for _, opt in ipairs(options) do
-                        table.insert(role_items, {
-                            text     = opt.label,
-                            callback = function()
-                                card.role = opt.code; save()
-                                UIManager:close(role_menu)
-                                afterSave()
-                            end,
-                        })
-                    end
-                    role_menu = Menu:new{
-                        title       = "Оберіть роль",
-                        item_table  = role_items,
-                        width       = Screen:getWidth(),
-                        show_parent = self_ref.ui,
-                    }
-                    UIManager:show(role_menu)
                 end,
             },
             {
@@ -1877,14 +2010,6 @@ function CharCards:onEditCard(card)
                             if s ~= "" then table.insert(t, s) end
                         end
                         card.relationships = t; save(); afterSave()
-                    end)
-                end,
-            },
-            {
-                text     = "Звʼязок з головним персонажем: " .. (card.relation_to_protagonist or ""),
-                callback = function()
-                    editTextField("Звʼязок з головним персонажем", card.relation_to_protagonist, false, function(val)
-                        card.relation_to_protagonist = val; save(); afterSave()
                     end)
                 end,
             },
@@ -1968,9 +2093,8 @@ function CharCards:showCardList()
     local self_ref = self
     local items = {}
     for _, c in ipairs(cards) do
-        local role_suffix = (c.role and ROLE_LABELS[c.role]) and ("  [" .. ROLE_LABELS[c.role] .. "]") or ""
         table.insert(items, {
-            text     = c.name .. role_suffix,
+            text     = c.name,
             callback = function() self_ref:showCardView(c) end,
         })
     end
