@@ -63,29 +63,11 @@ See below (українською) for full details in Ukrainian.
 
 ### Встановлення
 
-```bash
-git clone https://github.com/<your-username>/charcards.git
-cp -r charcards/charcards.koplugin /шлях/до/koreader/plugins/
-```
+Скопіювати папку charcards.koplugin з файлами main.lua і _meta.lua в папку koreader/plugins.
 
 Перезапустити KOReader. Пункт меню зʼявиться в **Інструменти → Картки
 персонажів**.
 
-### Localization / English
-
-Увесь текст інтерфейсу й обидва промпти до Gemini зведені в одну таблицю
-(`CharCards.L`), тож переклад — це окремий файл-патч, а не форк плагіна.
-
-```bash
-cp patches/1-charcards-en.lua /шлях/до/koreader/patches/
-```
-
-Перезапустити KOReader — інтерфейс і картки персонажів тепер англійською.
-Щоб повернутись до української — просто видали цей файл із `koreader/patches/`.
-
-Якщо захочеш іншу мову — скопіюй `patches/1-charcards-en.lua`, зміни назву
-файлу (напр. `1-charcards-de.lua`) і перепиши значення в таблиці на свою
-мову; ключі (зліва від `=`) чіпати не треба.
 
 ### Ключ Gemini API
 
@@ -103,9 +85,14 @@ cp patches/1-charcards-en.lua /шлях/до/koreader/patches/
    ```
    Зручно, якщо не хочеш набирати довгий ключ на сенсорному екрані.
 
-**`api.lua` НІКОЛИ не потрапляє в git** (є в `.gitignore`) — там лежить
-особистий секретний ключ, не публікуй його.
 
+### Localization / English
+
+For English translation of a patch copy t1-charcards-en.lua into the /koreader/patches/ and restart koreader.
+
+
+Перезапустити KOReader — інтерфейс і картки персонажів тепер англійською.
+Щоб повернутись до української — просто видали цей файл із `koreader/patches/`.
 ### Мережа
 
 Обидві дії, що звертаються до Gemini, спершу перевіряють підключення до
