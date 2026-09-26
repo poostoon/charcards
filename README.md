@@ -4,7 +4,11 @@ A fully manual, AI-assisted character tracker plugin for [KOReader](https://gith
 No background scanning, no automatic extraction — you decide when a character
 gets added and what counts as new information about them.
 
-UI and prompts are in Ukrainian. See below (українською) for full details.
+The interface and Gemini prompts are Ukrainian by default. An **English
+localization patch** is included (`patches/1-charcards-en.lua`) — see
+[Localization](#localization--english) below for one-file installation.
+
+See below (українською) for full details in Ukrainian.
 
 ---
 
@@ -66,6 +70,22 @@ cp -r charcards/charcards.koplugin /шлях/до/koreader/plugins/
 
 Перезапустити KOReader. Пункт меню зʼявиться в **Інструменти → Картки
 персонажів**.
+
+### Localization / English
+
+Увесь текст інтерфейсу й обидва промпти до Gemini зведені в одну таблицю
+(`CharCards.L`), тож переклад — це окремий файл-патч, а не форк плагіна.
+
+```bash
+cp patches/1-charcards-en.lua /шлях/до/koreader/patches/
+```
+
+Перезапустити KOReader — інтерфейс і картки персонажів тепер англійською.
+Щоб повернутись до української — просто видали цей файл із `koreader/patches/`.
+
+Якщо захочеш іншу мову — скопіюй `patches/1-charcards-en.lua`, зміни назву
+файлу (напр. `1-charcards-de.lua`) і перепиши значення в таблиці на свою
+мову; ключі (зліва від `=`) чіпати не треба.
 
 ### Ключ Gemini API
 

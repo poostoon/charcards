@@ -2,16 +2,16 @@
 -- CharCards — мінімалістичний, повністю ручний трекер персонажів для KOReader.
 --
 -- Жодного автосканування, жодного фонового пошуку по тексту. Дії:
---   1) Виділив ім'я персонажа в тексті → "Додати персонажа" — бере це ім'я
+--   1) Виділив ім'я персонажа в тексті → L.action_add_character — бере це ім'я
 --      + контекст (поточна сторінка + кілька сторінок назад), питає Gemini
 --      повну картку (роль, псевдоніми, професія, зовнішність, характер,
 --      звʼязки — та сама структура полів, що й у KoCharacters), зберігає.
---   2) Виділив довільний уривок → "Додати до персонажа" — обираєш зі списку
+--   2) Виділив довільний уривок → L.action_add_fact — обираєш зі списку
 --      вже доданих персонажів; Gemini аналізує цитату СВОЇМИ словами (не
 --      копіює її) і визначає, ЯКІ поля картки вона поповнює (професія,
 --      зовнішність, характер, звʼязки, псевдоніми, роль) — плагін сам
 --      домішує кожен шматок у потрібне поле, а не в один загальний список.
---   3) "Серія книг" — за бажанням, книгу можна прив'язати до спільної серії,
+--   3) L.menu_series — за бажанням, книгу можна прив'язати до спільної серії,
 --      щоб персонажі (і вся їхня картка) переходили з першої книги в другу,
 --      а не починались щоразу з нуля.
 --
@@ -62,6 +62,177 @@ local SETTING_UNDERLINE_ON = "charcards_underline_enabled"
 
 local function log(msg) logger.info("CharCards: " .. tostring(msg)) end
 
+-- ===== Таблиця рядків інтерфейсу (для локалізації через патч) =====
+-- Патч перекладу (напр. на англійську) просто перезаписує значення в цій
+-- таблиці через CharCards.L після userpatch.registerPatchPluginFunc — не
+-- чіпаючи жодної функції нижче. Усі функції читають L.* як звичайний
+-- upvalue, тож мутація тієї самої таблиці ззовні видно всюди одразу.
+
+local function fillTemplate(tpl, vars)
+    return (tpl:gsub("{{([%w_]+)}}", function(key) return tostring(vars[key] or "") end))
+end
+
+local L = {
+    prompt_create_character = "Ти аналізуєш уривок художньої книги українською мовою.\n\n" ..
+        "Уривок (кілька останніх сторінок, які читач щойно прочитав):\n\"\"\"\n{{context}}\n\"\"\"\n\n" ..
+        "У цьому уривку згадується персонаж на ім'я «{{name}}». Склади про нього " ..
+        "коротку картку на основі ЛИШЕ цього уривка — нічого не вигадуй, не бери інформацію " ..
+        "звідки-інде. Порожні поля лиши порожніми, якщо в уривку про це нічого нема.\n\n" ..
+        "Формат відповіді — СУВОРО лише JSON, без пояснень і без ```:\n" ..
+        '{\n' ..
+        '  "aliases": ["інше ім\'я чи прізвисько, якщо в уривку так до нього звертаються"],\n' ..
+        '  "occupation": "рід занять/статус (наприклад: коваль, вітчим Джека, власник компанії) — порожній рядок якщо невідомо",\n' ..
+        '  "physical_description": "зовнішність ЛИШЕ якщо явно описана в тексті, інакше порожній рядок",\n' ..
+        '  "personality": "стабільні риси характеру, зроблені висновком із того, як він діє/говорить (не переказ подій) — порожній рядок якщо не видно",\n' ..
+        '  "relationships": ["ХТО ЦЕЙ ПЕРСОНАЖ для іншої людини — завжди в такому напрямку: \'донька короля\', \'вітчим Джека\', \'ворог Спіді\'. НІКОЛИ не описуй у зворотному напрямку (не \'батько — король\', а \'донька короля\')."],\n' ..
+        '  "standout_trait": "ОДНА найпомітніша, найхарактерніша риса — зовнішня чи поведінкова, те, за чим його одразу впізнати — або порожній рядок",\n' ..
+        '  "background": "коротка передісторія/походження персонажа, якщо згадано в уривку (звідки він, що з ним було раніше) — інакше порожній рядок"\n' ..
+        '}',
+    prompt_update_character = 'Ось цитата з книги:\n"""\n{{quote}}\n"""\n\n' ..
+        "Це стосується персонажа «{{name}}». Ось його поточна картка:\n" ..
+        "Рід занять: {{occupation}}\n" ..
+        "Зовнішність: {{physical_description}}\n" ..
+        "Характер: {{personality}}\n" ..
+        "Звʼязки: {{relationships}}\n" ..
+        "Найхарактерніша риса: {{standout_trait}}\n" ..
+        "Бекграунд: {{background}}\n\n" ..
+        "Онови картку цитатою вище. Для полів \"occupation\", \"physical_description\", " ..
+        "\"personality\", \"background\" поверни ПОВНЕ бажане значення поля (не лише новий " ..
+        "шматок!) — об'єднай те, що вже записано вище, з тим, що дає цитата, стисло, своїми " ..
+        "словами, без дублювання ЗМІСТУ. Якщо цитата підказує те саме, що вже записано, лише " ..
+        "іншими словами (наприклад, у полі вже є «лисий», а цитата каже «з лисою головою» чи " ..
+        "«без волосся») — це ОДНЕ Й ТЕ САМЕ, познач так лише ОДИН раз, обери влучніше " ..
+        "формулювання, не пиши обидва. Якщо для якогось поля цитата взагалі нічого не додає — " ..
+        "поверни його ПОТОЧНЕ значення без змін (скопіюй те, що вище), а не порожній рядок — " ..
+        "порожній рядок лиши тільки якщо про це поле взагалі нічого не відомо ні зараз, ні з " ..
+        "цитати. Кожне поле — максимум 1-2 короткі речення, ніколи не переписуй цитату дослівно.\n\n" ..
+        "Формат відповіді — СУВОРО лише JSON, без пояснень і без ```:\n" ..
+        '{\n' ..
+        '  "occupation": "повне оновлене значення поля (або поточне без змін, або порожньо)",\n' ..
+        '  "physical_description": "повне оновлене значення поля (або поточне без змін, або порожньо)",\n' ..
+        '  "personality": "повне оновлене значення поля ЯК ВИСНОВОК із того, як персонаж діє/говорить (не переказ подій), або поточне без змін, або порожньо",\n' ..
+        '  "aliases": ["нове ім\'я/прізвисько, якщо цитата його розкриває"],\n' ..
+        '  "relationships": ["новий стосунок до когось, якщо є в цитаті — завжди у формі \'цей персонаж є [хтось] відносно [когось]\' (напр. \'донька короля\', не \'батько — король\')"],\n' ..
+        '  "standout_trait": "ЛИШЕ якщо ця цитата показує щось помітніше/характерніше за те, що вже записано вище — нова найхарактерніша риса, інакше порожній рядок",\n' ..
+        '  "background": "повне оновлене значення поля (або поточне без змін, або порожньо)"\n' ..
+        '}',
+    action_add_character = "Додати персонажа",
+    action_add_fact = "Додати до персонажа",
+    added_colon = "Додано: ",
+    already_in_cards = "» вже є в картках.",
+    analyzing_context_for = "Аналізую контекст для «",
+    analyzing_quote = "Аналізую уривок…",
+    api_key_cleared = "Ключ видалено.",
+    api_key_hint = "Встав ключ (aistudio.google.com)",
+    api_key_not_set = "API-ключ не задано.",
+    api_key_saved = "Ключ збережено.",
+    api_key_title = "Ключ Gemini API",
+    appearance_colon = "Зовнішність:",
+    appearance_colon_sp = "Зовнішність: ",
+    background_colon = "Бекграунд:",
+    background_colon_sp = "Бекграунд: ",
+    btn_cancel = "Скасувати",
+    btn_clear = "Очистити",
+    btn_create = "Створити",
+    btn_delete = "Видалити",
+    btn_save = "Зберегти",
+    btn_unlink = "Відв'язати",
+    change_character_btn = "Змінити персонажа",
+    character_not_found_db = "Персонажа не знайдено в базі (видалили?).",
+    characters_count_only = " персонаж(ів)",
+    characters_count_paren = " персонаж(ів))",
+    could_not_gather_context = "Не вдалося зібрати контекст: ",
+    delete_character_btn = "Видалити персонажа",
+    delete_confirm_prefix = "Видалити «",
+    delete_confirm_suffix = "» і всі його дані?",
+    diag_file_exists_test = "файл книги існує (test -f): ",
+    diag_unzip_found = "unzip знайдено: ",
+    doc_type_unsupported = "цей тип документа не підтримується (потрібен EPUB/FB2-подібний)",
+    edit_aliases_colon = "Інші імена: ",
+    edit_aliases_hint = "Інші імена (через кому)",
+    edit_appearance_label = "Зовнішність",
+    edit_background_label = "Бекграунд",
+    edit_name_colon = "Ім'я: ",
+    edit_name_label = "Ім'я",
+    edit_occupation_colon = "Рід занять: ",
+    edit_personality_label = "Характер",
+    edit_relationships_hint = "Звʼязки (кожен з нового рядка)",
+    edit_standout_colon = "Найхарактерніша риса: ",
+    edit_title_prefix = "Редагувати: ",
+    err_api_http = "Помилка API (HTTP ",
+    err_api_key_file_exec = "api.lua: помилка виконання — ",
+    err_cant_determine_page = "не вдалося визначити сторінку",
+    err_cant_parse_response = "Не вдалося розібрати відповідь Gemini: ",
+    err_chapter_read_failed = "не вдалося прочитати розділ (",
+    err_container_not_found = "container.xml: не знайдено full-path",
+    err_container_read_failed = "не вдалося прочитати META-INF/container.xml (",
+    err_gemini_invalid_json = "Gemini повернув невалідний JSON: ",
+    err_gemini_no_text_raw = "\nСирий текст: ",
+    err_getpagexpointer = "getPageXPointer не вдався",
+    err_getposfromxpointer = "getPosFromXPointer не вдався",
+    err_href_not_found = "href для spine-елемента не знайдено",
+    err_network = "Помилка мережі: ",
+    err_opf_read_failed = "не вдалося прочитати .opf (",
+    err_text_too_short = "після очищення тексту замало",
+    err_unzip_not_in_path = "бінарник unzip не знайдено в PATH",
+    err_write_failed = "не вдалося записати ",
+    log_draw_error = "помилка малювання: ",
+    log_findalltext_failed = "findAllText не вдався, чанк=",
+    log_findalltext_failed_inc = "findAllText (інкремент) не вдався, чанк=",
+    log_finishscan_error = "finishScan помилка: ",
+    log_incrementalscan_error = "incrementalScan помilka: ",
+    log_mentions = " згадувань",
+    log_new_mentions = " нових згадувань",
+    log_plugin_initialized = "плагін ініціалізовано",
+    mentions_found_suffix = " згадувань персонажів знайдено",
+    menu_api_key_set = " (задано)",
+    menu_api_key_unset = " (не задано)",
+    menu_card_list = "Список персонажів",
+    menu_rescan_now = "Пересканувати зараз",
+    menu_series = "Серія книг",
+    menu_series_linked = "Серія книг: ",
+    menu_series_unlinked = "Серія книг (не прив'язано)",
+    menu_title = "Картки персонажів",
+    menu_underline = "Підкреслення персонажів у тексті",
+    menu_underline_enable = "Увімкнути підкреслення",
+    net_no_connection = "Немає підключення до інтернету.",
+    net_wifi_prompt_ok = "Коли Wi-Fi увімкнеться, повтори дію ще раз.",
+    no_book_open = "Немає відкритої книги.",
+    no_characters_at_all = "Ще нема жодного персонажа.\nВиділи ім'я в тексті → «Додати персонажа».",
+    no_characters_yet = "Ще нема жодного персонажа — спершу додай когось виділенням імені.",
+    no_data_yet = "Даних поки нема.",
+    nothing_new_from_quote = "Gemini не знайшов нової інформації в цьому уривку.",
+    occupation_label = "Рід занять",
+    personality_colon = "Характер:",
+    personality_colon_sp = "Характер: ",
+    relationships_colon = "Звʼязки:",
+    relationships_colon_sp = "Звʼязки: ",
+    scanning_book = "Сканую книгу на персонажів…",
+    series_added_merged = "». Додано ",
+    series_added_merged_mid = " нових персонажів, обʼєднано з наявними: ",
+    series_create_btn = "Створити нову серію й привʼязати цю книгу",
+    series_link_existing_btn = "Прив'язати до існуючої серії",
+    series_linked_msg_pre = "Привʼязано до серії «",
+    series_linked_prefix = "Ця книга прив'язана до серії «",
+    series_name_hint = "напр. Талісман",
+    series_name_title = "Назва серії",
+    series_none_yet = "Ще немає жодної серії. Спершу створи нову — «Серія книг → Створити нову серію».",
+    series_pick_title = "Обери серію",
+    series_unlink_body1 = "Персонажі серії нікуди не зникнуть — вони й далі доступні ",
+    series_unlink_body2 = "з будь-якої іншої книги, привʼязаної до цієї серії. Ця книга ",
+    series_unlink_body3 = "просто повернеться до власного, окремого списку персонажів ",
+    series_unlink_body4 = "(того, що був до привʼязки).",
+    series_unlink_btn = "Відв'язати від серії",
+    series_unlink_confirm_pre = "Відв'язати цю книгу від серії «",
+    series_unlink_qmark = "»?\n\n",
+    series_unlinked_msg = "Відв'язано від серії.",
+    standout_colon = "Найхарактерніше: ",
+    unknown_value = "невідомо",
+    updated_colon = "Оновлено «",
+    which_character_prompt = "До якого персонажа додати?",
+}
+
+
 -- ===== Ключ Gemini API — окремий файл api.lua ПРЯМО В ПАПЦІ ПЛАГІНА =====
 -- Навмисно не в koreader/settings/ і не в спільному settings.reader.lua:
 -- сюди можна підкласти ключ вручну через USB (одним рядком, без набору
@@ -89,7 +260,7 @@ local function getApiKeySetting()
     if not ok_load or not chunk then return nil end
     local ok_run, result = pcall(chunk)
     if not ok_run then
-        log("api.lua: помилка виконання — " .. tostring(result))
+        log(L.err_api_key_file_exec .. tostring(result))
         return nil
     end
     local key
@@ -106,7 +277,7 @@ local function saveApiKeySetting(key)
     key = (key or ""):gsub("^%s+", ""):gsub("%s+$", "")
     local f = io.open(API_KEY_FILE, "w")
     if not f then
-        log("не вдалося записати " .. API_KEY_FILE)
+        log(L.err_write_failed .. API_KEY_FILE)
         return false
     end
     local escaped = key:gsub("\\", "\\\\"):gsub('"', '\\"')
@@ -141,14 +312,14 @@ local function ensureNetworkThen(on_ready)
         local ok_prompt = pcall(function() NetworkMgr:promptWifiOn() end)
         if ok_prompt then
             UIManager:show(InfoMessage:new{
-                text = "Коли Wi-Fi увімкнеться, повтори дію ще раз.",
+                text = L.net_wifi_prompt_ok,
                 timeout = 4,
             })
             return
         end
     end
 
-    UIManager:show(InfoMessage:new{ text = "Немає підключення до інтернету.", timeout = 3 })
+    UIManager:show(InfoMessage:new{ text = L.net_no_connection, timeout = 3 })
 end
 
 -- ===== Українська нечутливість до регістру (Lua :lower() кирилицю не чіпає) =====
@@ -181,7 +352,7 @@ end
 -- Повертає parsed_table, nil  АБО  nil, error_message.
 local function callGemini(api_key, prompt)
     if not api_key or api_key == "" then
-        return nil, "API-ключ не задано."
+        return nil, L.api_key_not_set
     end
 
     local request_body = json.encode({
@@ -204,19 +375,19 @@ local function callGemini(api_key, prompt)
     })
 
     if not ok then
-        return nil, "Помилка мережі: " .. tostring(status)
+        return nil, L.err_network .. tostring(status)
     end
     if status ~= 200 then
         local raw = table.concat(response_body)
         local parsed = json.decode(raw)
         local detail = parsed and parsed.error and parsed.error.message or raw:sub(1, 200)
-        return nil, "Помилка API (HTTP " .. tostring(status) .. "): " .. tostring(detail)
+        return nil, L.err_api_http .. tostring(status) .. "): " .. tostring(detail)
     end
 
     local raw = table.concat(response_body)
     local parsed, _, err = json.decode(raw)
     if not parsed then
-        return nil, "Не вдалося розібрати відповідь Gemini: " .. tostring(err)
+        return nil, L.err_cant_parse_response .. tostring(err)
     end
 
     local text
@@ -233,7 +404,7 @@ local function callGemini(api_key, prompt)
     text = stripCodeFences(text)
     local result, _, jerr = json.decode(text)
     if not result then
-        return nil, "Gemini повернув невалідний JSON: " .. tostring(jerr) .. "\nСирий текст: " .. text:sub(1, 200)
+        return nil, L.err_gemini_invalid_json .. tostring(jerr) .. L.err_gemini_no_text_raw .. text:sub(1, 200)
     end
     return result
 end
@@ -284,9 +455,9 @@ local function diagnoseUnzip(epub_path)
 
     local which_out = popenRead("command -v unzip 2>&1")
     if not which_out or which_out:gsub("%s+", "") == "" then
-        table.insert(parts, "бінарник unzip не знайдено в PATH")
+        table.insert(parts, L.err_unzip_not_in_path)
     else
-        table.insert(parts, "unzip знайдено: " .. trim(which_out))
+        table.insert(parts, L.diag_unzip_found .. trim(which_out))
     end
 
     local ver_out = popenRead("unzip -v 2>&1")
@@ -295,7 +466,7 @@ local function diagnoseUnzip(epub_path)
     end
 
     local ok_exists = popenRead("test -f '" .. epub_path .. "' && echo так || echo ні")
-    table.insert(parts, "файл книги існує (test -f): " .. trim(ok_exists or "невідомо"))
+    table.insert(parts, L.diag_file_exists_test .. trim(ok_exists or L.unknown_value))
 
     return table.concat(parts, " | ")
 end
@@ -332,14 +503,14 @@ end
 local function fetchSpineChapterHtml(epub_path, n)
     local container = popenRead("unzip -p '" .. epub_path .. "' 'META-INF/container.xml' 2>/dev/null")
     if not container or #container < 20 then
-        return nil, "не вдалося прочитати META-INF/container.xml (" .. diagnoseUnzip(epub_path) .. ")"
+        return nil, L.err_container_read_failed .. diagnoseUnzip(epub_path) .. ")"
     end
     local opf_path = container:match('full%-path="([^"]+)"')
-    if not opf_path then return nil, "container.xml: не знайдено full-path" end
+    if not opf_path then return nil, L.err_container_not_found end
 
     local opf = popenRead("unzip -p '" .. epub_path .. "' '" .. opf_path .. "' 2>/dev/null")
     if not opf or #opf < 50 then
-        return nil, "не вдалося прочитати .opf (" .. diagnoseUnzip(epub_path) .. ")"
+        return nil, L.err_opf_read_failed .. diagnoseUnzip(epub_path) .. ")"
     end
 
     local count, item_id = 0, nil
@@ -353,14 +524,14 @@ local function fetchSpineChapterHtml(epub_path, n)
     local pat1 = [[item[^>]+href="([^"]+)"[^>]+id="]] .. esc_id .. [["]]
     local pat2 = [[item[^>]+id="]] .. esc_id .. [["[^>]+href="([^"]+)"]]
     local href = opf:match(pat2) or opf:match(pat1)
-    if not href then return nil, "href для spine-елемента не знайдено" end
+    if not href then return nil, L.err_href_not_found end
     href = urlDecode(href)
 
     local base = opf_path:match("^(.*/)") or ""
     local full = base .. href
     local chapter = popenRead("unzip -p '" .. epub_path .. "' '" .. full .. "' 2>/dev/null")
     if not chapter or #chapter < 100 then
-        return nil, "не вдалося прочитати розділ (" .. diagnoseUnzip(epub_path) .. ")"
+        return nil, L.err_chapter_read_failed .. diagnoseUnzip(epub_path) .. ")"
     end
     return chapter
 end
@@ -373,17 +544,17 @@ local function getContextText(self, back_pages)
     local doc = self.ui and self.ui.document
     if not doc or not doc.file then return nil, "немає відкритої книги" end
     if type(doc.getPageXPointer) ~= "function" then
-        return nil, "цей тип документа не підтримується (потрібен EPUB/FB2-подібний)"
+        return nil, L.doc_type_unsupported
     end
 
     local page
     local ok_pg = pcall(function() page = self.ui.view.state.page end)
-    if not ok_pg or not page then return nil, "не вдалося визначити сторінку" end
+    if not ok_pg or not page then return nil, L.err_cant_determine_page end
 
     local ok1, xp_cur = pcall(function() return doc:getPageXPointer(page) end)
-    if not ok1 or not xp_cur then return nil, "getPageXPointer не вдався" end
+    if not ok1 or not xp_cur then return nil, L.err_getpagexpointer end
     local ok2, pos_cur = pcall(function() return doc:getPosFromXPointer(xp_cur) end)
-    if not ok2 or not pos_cur then return nil, "getPosFromXPointer не вдався" end
+    if not ok2 or not pos_cur then return nil, L.err_getposfromxpointer end
 
     local frag_idx = tonumber(tostring(xp_cur):match("DocFragment%[(%d+)%]")) or 1
 
@@ -431,7 +602,7 @@ local function getContextText(self, back_pages)
     if not chapter then return nil, err end
 
     local text = stripHtml(chapter)
-    if #text < 50 then return nil, "після очищення тексту замало" end
+    if #text < 50 then return nil, L.err_text_too_short end
 
     local frag_span = math.max((frag_end_pos > 0 and frag_end_pos or pos_end + 20000) - frag_start_pos, 1)
     local function ratioOf(pos)
@@ -631,7 +802,7 @@ local function mergeArrayField(existing, new_items)
     return existing, added
 end
 
--- Застосовує результат Gemini для "Додати до персонажа": для текстових
+-- Застосовує результат Gemini для L.action_add_fact: для текстових
 -- полів (рід занять/зовнішність/характер/бекграунд) Gemini бачить старий
 -- текст ЦІЛКОМ і повертає вже готове, повністю переформульоване значення
 -- поля — тому тут просто ВСТАНОВЛЮЄМО його, а не дописуємо. Так вона сама
@@ -760,7 +931,7 @@ local function formatCompactCardText(card)
         table.insert(lines, truncateForCompact(card.background, 150))
     end
     if #lines == 0 then
-        table.insert(lines, "Даних поки нема.")
+        table.insert(lines, L.no_data_yet)
     end
     return table.concat(lines, "\n")
 end
@@ -769,41 +940,41 @@ end
 local function formatCardText(card)
     local lines = {}
     if card.aliases and #card.aliases > 0 then
-        table.insert(lines, "Інші імена: " .. table.concat(card.aliases, ", "))
+        table.insert(lines, L.edit_aliases_colon .. table.concat(card.aliases, ", "))
     end
     if card.occupation and card.occupation ~= "" then
-        table.insert(lines, "Рід занять: " .. card.occupation)
+        table.insert(lines, L.edit_occupation_colon .. card.occupation)
     end
     if card.aliases and #card.aliases > 0 or (card.occupation and card.occupation ~= "") then
         table.insert(lines, "")
     end
     if card.physical_description and card.physical_description ~= "" then
-        table.insert(lines, "Зовнішність:")
+        table.insert(lines, L.appearance_colon)
         table.insert(lines, card.physical_description)
         table.insert(lines, "")
     end
     if card.personality and card.personality ~= "" then
-        table.insert(lines, "Характер:")
+        table.insert(lines, L.personality_colon)
         table.insert(lines, card.personality)
         table.insert(lines, "")
     end
     if card.relationships and #card.relationships > 0 then
-        table.insert(lines, "Звʼязки:")
+        table.insert(lines, L.relationships_colon)
         for _, r in ipairs(card.relationships) do
             table.insert(lines, "• " .. r)
         end
         table.insert(lines, "")
     end
     if card.standout_trait and card.standout_trait ~= "" then
-        table.insert(lines, "Найхарактерніше: " .. card.standout_trait)
+        table.insert(lines, L.standout_colon .. card.standout_trait)
         table.insert(lines, "")
     end
     if card.background and card.background ~= "" then
-        table.insert(lines, "Бекграунд:")
+        table.insert(lines, L.background_colon)
         table.insert(lines, card.background)
     end
     if #lines == 0 then
-        table.insert(lines, "Даних поки нема.")
+        table.insert(lines, L.no_data_yet)
     end
     return table.concat(lines, "\n")
 end
@@ -1015,6 +1186,8 @@ local CharCards = WidgetContainer:extend{
     is_doc_only = true,
 }
 
+CharCards.L = L  -- відкриває таблицю рядків для зовнішніх патчів (див. вище)
+
 function CharCards:init()
     self.ui.menu:registerToMainMenu(self)
 
@@ -1023,7 +1196,7 @@ function CharCards:init()
 
         self.ui.highlight:addToHighlightDialog("charcards_add_new", function(highlight_instance)
             return {
-                text = "Додати персонажа",
+                text = L.action_add_character,
                 callback = function()
                     local selected = highlight_instance.selected_text
                     local name = selected and (selected.text or selected.word or "") or ""
@@ -1038,7 +1211,7 @@ function CharCards:init()
 
         self.ui.highlight:addToHighlightDialog("charcards_add_fact", function(highlight_instance)
             return {
-                text = "Додати до персонажа",
+                text = L.action_add_fact,
                 callback = function()
                     local selected = highlight_instance.selected_text
                     local quote = selected and (selected.text or selected.word or "") or ""
@@ -1058,7 +1231,7 @@ function CharCards:init()
     self:mountUnderlineOverlay()
     self:mountTapHandler()
 
-    log("плагін ініціалізовано")
+    log(L.log_plugin_initialized)
 end
 
 -- ===== Підкреслення: сканування, кеш, малювання, тап =====
@@ -1081,7 +1254,7 @@ function CharCards:mountUnderlineOverlay()
     view.paintTo = function(view_self, bb, x, y)
         orig(view_self, bb, x, y)
         local ok, err = pcall(function() plugin:_drawUnderlines(bb) end)
-        if not ok then log("помилка малювання: " .. tostring(err)) end
+        if not ok then log(L.log_draw_error .. tostring(err)) end
     end
     self._cc_paint_wrapped = true
 end
@@ -1285,9 +1458,9 @@ function CharCards:scanForCharacters(force, silent)
             plugin._cc_xp_matches = xp_matches
             plugin._cc_by_page = buildMatchesByPage(plugin, doc, xp_matches)
             plugin._cc_box_sig = nil
-            log("scanForCharacters: " .. #xp_matches .. " згадувань")
+            log("scanForCharacters: " .. #xp_matches .. L.log_mentions)
             if not silent then
-                UIManager:show(InfoMessage:new{ text = #xp_matches .. " згадувань персонажів знайдено", timeout = 3 })
+                UIManager:show(InfoMessage:new{ text = #xp_matches .. L.mentions_found_suffix, timeout = 3 })
             end
             if plugin.ui.view then
                 if plugin.ui.view.dialog then UIManager:setDirty(plugin.ui.view.dialog, "ui") end
@@ -1298,7 +1471,7 @@ function CharCards:scanForCharacters(force, silent)
             end)
         end)
         plugin._cc_scan_in_progress = false
-        if not ok_f then log("finishScan помилка: " .. tostring(err_f)) end
+        if not ok_f then log(L.log_finishscan_error .. tostring(err_f)) end
     end
 
     local function step()
@@ -1313,7 +1486,7 @@ function CharCards:scanForCharacters(force, silent)
         if ok1 and hits1 then
             for _, h in ipairs(hits1) do table.insert(hits, h) end
         else
-            log("findAllText не вдався, чанк=" .. idx .. "/" .. #patterns)
+            log(L.log_findalltext_failed .. idx .. "/" .. #patterns)
         end
         -- Невелика (не нульова) пауза між шматками — не просто повертає
         -- керування в той самий такт подій, а справді дає KOReader шанс
@@ -1325,7 +1498,7 @@ function CharCards:scanForCharacters(force, silent)
     end
 
     if not silent then
-        UIManager:show(InfoMessage:new{ text = "Сканую книгу на персонажів…", timeout = 2 })
+        UIManager:show(InfoMessage:new{ text = L.scanning_book, timeout = 2 })
     end
     UIManager:scheduleIn(0.02, step)
 end
@@ -1398,7 +1571,7 @@ function CharCards:_incrementalScan(new_terms)
             end
             plugin._cc_by_page = buildMatchesByPage(plugin, doc, plugin._cc_xp_matches)
             plugin._cc_box_sig = nil
-            log("incrementalScan: +" .. added .. " нових згадувань")
+            log("incrementalScan: +" .. added .. L.log_new_mentions)
             if plugin.ui.view then
                 if plugin.ui.view.dialog then UIManager:setDirty(plugin.ui.view.dialog, "ui") end
                 UIManager:setDirty(nil, "ui")
@@ -1409,7 +1582,7 @@ function CharCards:_incrementalScan(new_terms)
             end)
         end)
         plugin._cc_scan_in_progress = false
-        if not ok_f then log("incrementalScan помilka: " .. tostring(err_f)) end
+        if not ok_f then log(L.log_incrementalscan_error .. tostring(err_f)) end
     end
 
     local function step()
@@ -1424,7 +1597,7 @@ function CharCards:_incrementalScan(new_terms)
         if ok1 and hits1 then
             for _, h in ipairs(hits1) do table.insert(hits, h) end
         else
-            log("findAllText (інкремент) не вдався, чанк=" .. idx .. "/" .. #patterns)
+            log(L.log_findalltext_failed_inc .. idx .. "/" .. #patterns)
         end
         UIManager:scheduleIn(0.02, step)
     end
@@ -1436,17 +1609,17 @@ end
 function CharCards:addToMainMenu(menu_items)
     local self_ref = self
     menu_items.charcards = {
-        text          = "Картки персонажів",
+        text          = L.menu_title,
         sorting_hint  = "tools",
         sub_item_table = {
             {
-                text     = "Список персонажів",
+                text     = L.menu_card_list,
                 callback = function() self_ref:showCardList() end,
             },
             {
                 text_func = function()
                     local k = getApiKeySetting()
-                    return "Ключ Gemini API" .. ((k and k ~= "") and " (задано)" or " (не задано)")
+                    return L.api_key_title .. ((k and k ~= "") and L.menu_api_key_set or L.menu_api_key_unset)
                 end,
                 keep_menu_open = true,
                 callback = function() self_ref:showApiKeyDialog() end,
@@ -1454,19 +1627,19 @@ function CharCards:addToMainMenu(menu_items)
             {
                 text_func = function()
                     local series_id = getSeriesId(self_ref)
-                    if not series_id then return "Серія книг (не прив'язано)" end
+                    if not series_id then return L.menu_series_unlinked end
                     local name = getSeriesFile(series_id):readSetting("name") or series_id
-                    return "Серія книг: " .. name
+                    return L.menu_series_linked .. name
                 end,
                 keep_menu_open = true,
                 callback = function() self_ref:showSeriesMenu() end,
             },
             {
-                text = "Підкреслення персонажів у тексті",
+                text = L.menu_underline,
                 keep_menu_open = true,
                 sub_item_table = {
                     {
-                        text = "Увімкнути підкреслення",
+                        text = L.menu_underline_enable,
                         checked_func = function()
                             return G_reader_settings:readSetting(SETTING_UNDERLINE_ON) == true
                         end,
@@ -1481,7 +1654,7 @@ function CharCards:addToMainMenu(menu_items)
                         end,
                     },
                     {
-                        text = "Пересканувати зараз",
+                        text = L.menu_rescan_now,
                         keep_menu_open = true,
                         callback = function() self_ref:scanForCharacters(true) end,
                     },
@@ -1500,13 +1673,13 @@ function CharCards:getApiKey(on_have_key)
     local self_ref = self
     local dialog
     dialog = InputDialog:new{
-        title      = "Ключ Gemini API",
+        title      = L.api_key_title,
         input      = "",
-        input_hint = "Встав ключ (aistudio.google.com)",
+        input_hint = L.api_key_hint,
         buttons    = {{
-            { text = "Скасувати", callback = function() UIManager:close(dialog) end },
+            { text = L.btn_cancel, callback = function() UIManager:close(dialog) end },
             {
-                text             = "Зберегти",
+                text             = L.btn_save,
                 is_enter_default = true,
                 callback         = function()
                     local k = trim(dialog:getInputText() or "")
@@ -1526,28 +1699,28 @@ function CharCards:showApiKeyDialog()
     local current = getApiKeySetting() or ""
     local dialog
     dialog = InputDialog:new{
-        title      = "Ключ Gemini API",
+        title      = L.api_key_title,
         input      = current,
-        input_hint = "Встав ключ (aistudio.google.com)",
+        input_hint = L.api_key_hint,
         buttons    = {{
-            { text = "Скасувати", callback = function() UIManager:close(dialog) end },
+            { text = L.btn_cancel, callback = function() UIManager:close(dialog) end },
             {
-                text     = "Очистити",
+                text     = L.btn_clear,
                 callback = function()
                     UIManager:close(dialog)
                     saveApiKeySetting("")
-                    UIManager:show(InfoMessage:new{ text = "Ключ видалено.", timeout = 2 })
+                    UIManager:show(InfoMessage:new{ text = L.api_key_cleared, timeout = 2 })
                 end,
             },
             {
-                text             = "Зберегти",
+                text             = L.btn_save,
                 is_enter_default = true,
                 callback         = function()
                     local k = trim(dialog:getInputText() or "")
                     UIManager:close(dialog)
                     saveApiKeySetting(k)
                     UIManager:show(InfoMessage:new{
-                        text = k ~= "" and "Ключ збережено." or "Ключ видалено.",
+                        text = k ~= "" and L.api_key_saved or L.api_key_cleared,
                         timeout = 2,
                     })
                 end,
@@ -1570,41 +1743,41 @@ function CharCards:showSeriesMenu()
         local name = s:readSetting("name") or series_id
         local n_cards = #loadCards(self)
         table.insert(items, {
-            text = "Ця книга прив'язана до серії «" .. name .. "» (" .. n_cards .. " персонаж(ів))",
+            text = L.series_linked_prefix .. name .. "» (" .. n_cards .. L.characters_count_paren,
             callback = function() end,
         })
         table.insert(items, {
-            text = "Відв'язати від серії",
+            text = L.series_unlink_btn,
             keep_menu_open = false,
             callback = function()
                 UIManager:show(ConfirmBox:new{
-                    text = "Відв'язати цю книгу від серії «" .. name .. "»?\n\n" ..
-                           "Персонажі серії нікуди не зникнуть — вони й далі доступні " ..
-                           "з будь-якої іншої книги, привʼязаної до цієї серії. Ця книга " ..
-                           "просто повернеться до власного, окремого списку персонажів " ..
-                           "(того, що був до привʼязки).",
-                    ok_text = "Відв'язати",
+                    text = L.series_unlink_confirm_pre .. name .. L.series_unlink_qmark ..
+                           L.series_unlink_body1 ..
+                           L.series_unlink_body2 ..
+                           L.series_unlink_body3 ..
+                           L.series_unlink_body4,
+                    ok_text = L.btn_unlink,
                     ok_callback = function()
                         setSeriesId(self_ref, nil)
                         self_ref:clearUnderlines()
-                        UIManager:show(InfoMessage:new{ text = "Відв'язано від серії.", timeout = 2 })
+                        UIManager:show(InfoMessage:new{ text = L.series_unlinked_msg, timeout = 2 })
                     end,
                 })
             end,
         })
     else
         table.insert(items, {
-            text = "Прив'язати до існуючої серії",
+            text = L.series_link_existing_btn,
             callback = function() self_ref:showLinkToSeriesPicker() end,
         })
         table.insert(items, {
-            text = "Створити нову серію й привʼязати цю книгу",
+            text = L.series_create_btn,
             callback = function() self_ref:showCreateSeriesDialog() end,
         })
     end
 
     UIManager:show(Menu:new{
-        title       = "Серія книг",
+        title       = L.menu_series,
         item_table  = items,
         width       = Screen:getWidth(),
         show_parent = self.ui,
@@ -1616,7 +1789,7 @@ function CharCards:showLinkToSeriesPicker()
     local series_list = listSeries()
     if #series_list == 0 then
         UIManager:show(InfoMessage:new{
-            text = "Ще немає жодної серії. Спершу створи нову — «Серія книг → Створити нову серію».",
+            text = L.series_none_yet,
             timeout = 4,
         })
         return
@@ -1629,7 +1802,7 @@ function CharCards:showLinkToSeriesPicker()
         })
     end
     UIManager:show(Menu:new{
-        title       = "Обери серію",
+        title       = L.series_pick_title,
         item_table  = items,
         width       = Screen:getWidth(),
         show_parent = self.ui,
@@ -1640,13 +1813,13 @@ function CharCards:showCreateSeriesDialog()
     local self_ref = self
     local dialog
     dialog = InputDialog:new{
-        title      = "Назва серії",
+        title      = L.series_name_title,
         input      = "",
-        input_hint = "напр. Талісман",
+        input_hint = L.series_name_hint,
         buttons    = {{
-            { text = "Скасувати", callback = function() UIManager:close(dialog) end },
+            { text = L.btn_cancel, callback = function() UIManager:close(dialog) end },
             {
-                text             = "Створити",
+                text             = L.btn_create,
                 is_enter_default = true,
                 callback         = function()
                     local name = trim(dialog:getInputText() or "")
@@ -1693,13 +1866,13 @@ function CharCards:_linkToSeries(series_id, series_name)
         end
         saveCards(self, series_cards)
         UIManager:show(InfoMessage:new{
-            text = "Привʼязано до серії «" .. series_name .. "». Додано " .. added ..
-                   " нових персонажів, обʼєднано з наявними: " .. merged .. ".",
+            text = L.series_linked_msg_pre .. series_name .. L.series_added_merged .. added ..
+                   L.series_added_merged_mid .. merged .. ".",
             timeout = 4,
         })
     else
         UIManager:show(InfoMessage:new{
-            text = "Привʼязано до серії «" .. series_name .. "».",
+            text = L.series_linked_msg_pre .. series_name .. "».",
             timeout = 3,
         })
     end
@@ -1716,7 +1889,7 @@ end
 
 function CharCards:onAddNewCharacter(name)
     if not self.ui.doc_settings then
-        UIManager:show(InfoMessage:new{ text = "Немає відкритої книги." })
+        UIManager:show(InfoMessage:new{ text = L.no_book_open })
         return
     end
 
@@ -1724,7 +1897,7 @@ function CharCards:onAddNewCharacter(name)
     local existing = findCardByName(cards, name)
     if existing then
         UIManager:show(InfoMessage:new{
-            text = "«" .. existing.name .. "» вже є в картках.",
+            text = "«" .. existing.name .. L.already_in_cards,
             timeout = 3,
         })
         self:showCardView(existing)
@@ -1734,30 +1907,15 @@ function CharCards:onAddNewCharacter(name)
     local self_ref = self
     self:getApiKey(function(api_key)
         ensureNetworkThen(function()
-        UIManager:show(InfoMessage:new{ text = "Аналізую контекст для «" .. name .. "»…", timeout = 2 })
+        UIManager:show(InfoMessage:new{ text = L.analyzing_context_for .. name .. "»…", timeout = 2 })
 
         local context, ctx_err = getContextText(self_ref, 2)
         if not context then
-            UIManager:show(InfoMessage:new{ text = "Не вдалося зібрати контекст: " .. tostring(ctx_err) })
+            UIManager:show(InfoMessage:new{ text = L.could_not_gather_context .. tostring(ctx_err) })
             return
         end
 
-        local prompt = "Ти аналізуєш уривок художньої книги українською мовою.\n\n" ..
-            "Уривок (кілька останніх сторінок, які читач щойно прочитав):\n\"\"\"\n" ..
-            context .. "\n\"\"\"\n\n" ..
-            "У цьому уривку згадується персонаж на ім'я «" .. name .. "». Склади про нього " ..
-            "коротку картку на основі ЛИШЕ цього уривка — нічого не вигадуй, не бери інформацію " ..
-            "звідки-інде. Порожні поля лиши порожніми, якщо в уривку про це нічого нема.\n\n" ..
-            "Формат відповіді — СУВОРО лише JSON, без пояснень і без ```:\n" ..
-            '{\n' ..
-            '  "aliases": ["інше ім\'я чи прізвисько, якщо в уривку так до нього звертаються"],\n' ..
-            '  "occupation": "рід занять/статус (наприклад: коваль, вітчим Джека, власник компанії) — порожній рядок якщо невідомо",\n' ..
-            '  "physical_description": "зовнішність ЛИШЕ якщо явно описана в тексті, інакше порожній рядок",\n' ..
-            '  "personality": "стабільні риси характеру, зроблені висновком із того, як він діє/говорить (не переказ подій) — порожній рядок якщо не видно",\n' ..
-            '  "relationships": ["ХТО ЦЕЙ ПЕРСОНАЖ для іншої людини — завжди в такому напрямку: \'донька короля\', \'вітчим Джека\', \'ворог Спіді\'. НІКОЛИ не описуй у зворотному напрямку (не \'батько — король\', а \'донька короля\')."],\n' ..
-            '  "standout_trait": "ОДНА найпомітніша, найхарактерніша риса — зовнішня чи поведінкова, те, за чим його одразу впізнати — або порожній рядок",\n' ..
-            '  "background": "коротка передісторія/походження персонажа, якщо згадано в уривку (звідки він, що з ним було раніше) — інакше порожній рядок"\n' ..
-            '}'
+        local prompt = fillTemplate(L.prompt_create_character, { context = context, name = name })
 
         local result, err = callGemini(api_key, prompt)
         if not result then
@@ -1796,7 +1954,7 @@ function CharCards:onAddNewCharacter(name)
         table.insert(cards2, card)
         saveCards(self_ref, cards2)
 
-        UIManager:show(InfoMessage:new{ text = "Додано: " .. card.name, timeout = 2 })
+        UIManager:show(InfoMessage:new{ text = L.added_colon .. card.name, timeout = 2 })
         self_ref:showCardView(card)
         end)
     end)
@@ -1806,13 +1964,13 @@ end
 
 function CharCards:onAddFactToCharacter(quote)
     if not self.ui.doc_settings then
-        UIManager:show(InfoMessage:new{ text = "Немає відкритої книги." })
+        UIManager:show(InfoMessage:new{ text = L.no_book_open })
         return
     end
 
     local cards = loadCards(self)
     if #cards == 0 then
-        UIManager:show(InfoMessage:new{ text = "Ще нема жодного персонажа — спершу додай когось виділенням імені." })
+        UIManager:show(InfoMessage:new{ text = L.no_characters_yet })
         return
     end
 
@@ -1829,7 +1987,7 @@ function CharCards:onAddFactToCharacter(quote)
 
     local picker
     picker = Menu:new{
-        title       = "До якого персонажа додати?",
+        title       = L.which_character_prompt,
         item_table  = items,
         width       = Screen:getWidth(),
         show_parent = self.ui,
@@ -1841,36 +1999,18 @@ function CharCards:_submitFact(card, quote)
     local self_ref = self
     self:getApiKey(function(api_key)
         ensureNetworkThen(function()
-        UIManager:show(InfoMessage:new{ text = "Аналізую уривок…", timeout = 2 })
+        UIManager:show(InfoMessage:new{ text = L.analyzing_quote, timeout = 2 })
 
-        local prompt = 'Ось цитата з книги:\n"""\n' .. quote .. '\n"""\n\n' ..
-            "Це стосується персонажа «" .. card.name .. "». Ось його поточна картка:\n" ..
-            "Рід занять: " .. (card.occupation ~= "" and card.occupation or "невідомо") .. "\n" ..
-            "Зовнішність: " .. (card.physical_description ~= "" and card.physical_description or "невідомо") .. "\n" ..
-            "Характер: " .. (card.personality ~= "" and card.personality or "невідомо") .. "\n" ..
-            "Звʼязки: " .. (#card.relationships > 0 and table.concat(card.relationships, "; ") or "невідомо") .. "\n" ..
-            "Найхарактерніша риса: " .. (card.standout_trait ~= "" and card.standout_trait or "невідомо") .. "\n" ..
-            "Бекграунд: " .. (card.background ~= "" and card.background or "невідомо") .. "\n\n" ..
-            "Онови картку цитатою вище. Для полів \"occupation\", \"physical_description\", " ..
-            "\"personality\", \"background\" поверни ПОВНЕ бажане значення поля (не лише новий " ..
-            "шматок!) — об'єднай те, що вже записано вище, з тим, що дає цитата, стисло, своїми " ..
-            "словами, без дублювання ЗМІСТУ. Якщо цитата підказує те саме, що вже записано, лише " ..
-            "іншими словами (наприклад, у полі вже є «лисий», а цитата каже «з лисою головою» чи " ..
-            "«без волосся») — це ОДНЕ Й ТЕ САМЕ, познач так лише ОДИН раз, обери влучніше " ..
-            "формулювання, не пиши обидва. Якщо для якогось поля цитата взагалі нічого не додає — " ..
-            "поверни його ПОТОЧНЕ значення без змін (скопіюй те, що вище), а не порожній рядок — " ..
-            "порожній рядок лиши тільки якщо про це поле взагалі нічого не відомо ні зараз, ні з " ..
-            "цитати. Кожне поле — максимум 1-2 короткі речення, ніколи не переписуй цитату дослівно.\n\n" ..
-            "Формат відповіді — СУВОРО лише JSON, без пояснень і без ```:\n" ..
-            '{\n' ..
-            '  "occupation": "повне оновлене значення поля (або поточне без змін, або порожньо)",\n' ..
-            '  "physical_description": "повне оновлене значення поля (або поточне без змін, або порожньо)",\n' ..
-            '  "personality": "повне оновлене значення поля ЯК ВИСНОВОК із того, як персонаж діє/говорить (не переказ подій), або поточне без змін, або порожньо",\n' ..
-            '  "aliases": ["нове ім\'я/прізвисько, якщо цитата його розкриває"],\n' ..
-            '  "relationships": ["новий стосунок до когось, якщо є в цитаті — завжди у формі \'цей персонаж є [хтось] відносно [когось]\' (напр. \'донька короля\', не \'батько — король\')"],\n' ..
-            '  "standout_trait": "ЛИШЕ якщо ця цитата показує щось помітніше/характерніше за те, що вже записано вище — нова найхарактерніша риса, інакше порожній рядок",\n' ..
-            '  "background": "повне оновлене значення поля (або поточне без змін, або порожньо)"\n' ..
-            '}'
+        local prompt = fillTemplate(L.prompt_update_character, {
+            quote = quote,
+            name = card.name,
+            occupation = card.occupation ~= "" and card.occupation or L.unknown_value,
+            physical_description = card.physical_description ~= "" and card.physical_description or L.unknown_value,
+            personality = card.personality ~= "" and card.personality or L.unknown_value,
+            relationships = #card.relationships > 0 and table.concat(card.relationships, "; ") or L.unknown_value,
+            standout_trait = card.standout_trait ~= "" and card.standout_trait or L.unknown_value,
+            background = card.background ~= "" and card.background or L.unknown_value,
+        })
 
         local result, err = callGemini(api_key, prompt)
         if not result then
@@ -1881,19 +2021,19 @@ function CharCards:_submitFact(card, quote)
         local cards = loadCards(self_ref)
         local target = findCardByName(cards, card.name)
         if not target then
-            UIManager:show(InfoMessage:new{ text = "Персонажа не знайдено в базі (видалили?)." })
+            UIManager:show(InfoMessage:new{ text = L.character_not_found_db })
             return
         end
 
         local changed = mergeUpdateIntoCard(target, result)
         if #changed == 0 then
-            UIManager:show(InfoMessage:new{ text = "Gemini не знайшов нової інформації в цьому уривку.", timeout = 3 })
+            UIManager:show(InfoMessage:new{ text = L.nothing_new_from_quote, timeout = 3 })
             return
         end
 
         saveCards(self_ref, cards)
         UIManager:show(InfoMessage:new{
-            text = "Оновлено «" .. target.name .. "»: " .. table.concat(changed, ", "),
+            text = L.updated_colon .. target.name .. "»: " .. table.concat(changed, ", "),
             timeout = 4,
         })
         end)
@@ -1934,9 +2074,9 @@ function CharCards:onEditCard(card)
                 input         = current or "",
                 allow_newline = multiline,
                 buttons       = {{
-                    { text = "Скасувати", callback = function() UIManager:close(dialog) end },
+                    { text = L.btn_cancel, callback = function() UIManager:close(dialog) end },
                     {
-                        text             = "Зберегти",
+                        text             = L.btn_save,
                         is_enter_default = not multiline,
                         callback         = function()
                             UIManager:close(dialog)
@@ -1956,17 +2096,17 @@ function CharCards:onEditCard(card)
 
         local items = {
             {
-                text     = "Ім'я: " .. (card.name or ""),
+                text     = L.edit_name_colon .. (card.name or ""),
                 callback = function()
-                    editTextField("Ім'я", card.name, false, function(val)
+                    editTextField(L.edit_name_label, card.name, false, function(val)
                         if val ~= "" then card.name = val; save(); afterSave() end
                     end)
                 end,
             },
             {
-                text     = "Інші імена: " .. table.concat(card.aliases or {}, ", "),
+                text     = L.edit_aliases_colon .. table.concat(card.aliases or {}, ", "),
                 callback = function()
-                    editTextField("Інші імена (через кому)", table.concat(card.aliases or {}, ", "), false, function(val)
+                    editTextField(L.edit_aliases_hint, table.concat(card.aliases or {}, ", "), false, function(val)
                         local t = {}
                         for a in val:gmatch("[^,]+") do
                             local s = trim(a)
@@ -1977,33 +2117,33 @@ function CharCards:onEditCard(card)
                 end,
             },
             {
-                text     = "Рід занять: " .. (card.occupation or ""),
+                text     = L.edit_occupation_colon .. (card.occupation or ""),
                 callback = function()
-                    editTextField("Рід занять", card.occupation, false, function(val)
+                    editTextField(L.occupation_label, card.occupation, false, function(val)
                         card.occupation = val; save(); afterSave()
                     end)
                 end,
             },
             {
-                text     = "Зовнішність",
+                text     = L.edit_appearance_label,
                 callback = function()
-                    editTextField("Зовнішність", card.physical_description, true, function(val)
+                    editTextField(L.edit_appearance_label, card.physical_description, true, function(val)
                         card.physical_description = val; save(); afterSave()
                     end)
                 end,
             },
             {
-                text     = "Характер",
+                text     = L.edit_personality_label,
                 callback = function()
-                    editTextField("Характер", card.personality, true, function(val)
+                    editTextField(L.edit_personality_label, card.personality, true, function(val)
                         card.personality = val; save(); afterSave()
                     end)
                 end,
             },
             {
-                text     = "Звʼязки (кожен з нового рядка)",
+                text     = L.edit_relationships_hint,
                 callback = function()
-                    editTextField("Звʼязки (кожен з нового рядка)", table.concat(card.relationships or {}, "\n"), true, function(val)
+                    editTextField(L.edit_relationships_hint, table.concat(card.relationships or {}, "\n"), true, function(val)
                         local t = {}
                         for line in val:gmatch("[^\n]+") do
                             local s = trim(line)
@@ -2014,7 +2154,7 @@ function CharCards:onEditCard(card)
                 end,
             },
             {
-                text     = "Найхарактерніша риса: " .. (card.standout_trait or ""),
+                text     = L.edit_standout_colon .. (card.standout_trait or ""),
                 callback = function()
                     editTextField("Найхарактерніша риса", card.standout_trait, false, function(val)
                         card.standout_trait = val; save(); afterSave()
@@ -2022,9 +2162,9 @@ function CharCards:onEditCard(card)
                 end,
             },
             {
-                text     = "Бекграунд",
+                text     = L.edit_background_label,
                 callback = function()
-                    editTextField("Бекграунд", card.background, true, function(val)
+                    editTextField(L.edit_background_label, card.background, true, function(val)
                         card.background = val; save(); afterSave()
                     end)
                 end,
@@ -2032,7 +2172,7 @@ function CharCards:onEditCard(card)
         }
 
         edit_menu = Menu:new{
-            title       = "Редагувати: " .. card.name,
+            title       = L.edit_title_prefix .. card.name,
             item_table  = items,
             width       = Screen:getWidth(),
             show_parent = self_ref.ui,
@@ -2051,11 +2191,11 @@ function CharCards:showCardView(card)
         text  = formatCardText(card),
         buttons_table = {{
             {
-                text = "Видалити персонажа",
+                text = L.delete_character_btn,
                 callback = function()
                     UIManager:show(ConfirmBox:new{
-                        text = "Видалити «" .. card.name .. "» і всі його дані?",
-                        ok_text = "Видалити",
+                        text = L.delete_confirm_prefix .. card.name .. L.delete_confirm_suffix,
+                        ok_text = L.btn_delete,
                         ok_callback = function()
                             UIManager:close(viewer)
                             local cards = loadCards(self_ref)
@@ -2069,7 +2209,7 @@ function CharCards:showCardView(card)
                 end,
             },
             {
-                text = "Змінити персонажа",
+                text = L.change_character_btn,
                 callback = function()
                     UIManager:close(viewer)
                     self_ref:onEditCard(card)
@@ -2084,7 +2224,7 @@ function CharCards:showCardList()
     local cards = loadCards(self)
     if #cards == 0 then
         UIManager:show(InfoMessage:new{
-            text = "Ще нема жодного персонажа.\nВиділи ім'я в тексті → «Додати персонажа».",
+            text = L.no_characters_at_all,
             timeout = 4,
         })
         return
@@ -2100,7 +2240,7 @@ function CharCards:showCardList()
     end
 
     UIManager:show(Menu:new{
-        title       = #cards .. " персонаж(ів)",
+        title       = #cards .. L.characters_count_only,
         item_table  = items,
         width       = Screen:getWidth(),
         show_parent = self.ui,
