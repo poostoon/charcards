@@ -88,7 +88,7 @@ See below (українською) for full details in Ukrainian.
 
 ### Localization / English
 
-For English translation of a patch copy t1-charcards-en.lua into the /koreader/patches/ and restart koreader.
+For English translation of a patch copy 1-charcards-en.lua into the /koreader/patches/ and restart koreader.
 
 
 Перезапустити KOReader — інтерфейс і картки персонажів тепер англійською.
@@ -111,7 +111,7 @@ For English translation of a patch copy t1-charcards-en.lua into the /koreader/p
   елемента EPUB). Якщо персонаж з'явився на самому початку розділу — вікно
   контексту просто впирається в початок розділу.
 - Розраховано на **EPUB** (текст сторінки видобувається через unzip +
-  OPF/spine). FB2 напряму не підтримується — рекомендується конвертувати у
+  OPF/spine). FB2 напряму не підтримується (поки що) — рекомендується конвертувати у
   EPUB перед читанням.
 - Один ключ Gemini API на весь плагін (не per-book).
 
