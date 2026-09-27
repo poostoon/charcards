@@ -339,6 +339,40 @@ local function ukLower(s)
     return (s:lower():gsub("[\208\209\210][\128-\191]", CYR_LOWER))
 end
 
+-- Просте порівняння рядків після ukLower сортує за байтовим значенням
+-- Unicode, а не за українською абеткою — і/ї/є/ґ лежать в іншому блоці й
+-- випадають не на своє місце (перевірено: "Ґудзик"/"Єва"/"Іван" вилітали
+-- в кінець списку). Тому власна таблиця ваг під реальний алфавітний
+-- порядок — для сортування списку персонажів.
+local UK_ALPHABET = "абвгґдеєжзиіїйклмнопрстуфхцчшщьюя"
+local UK_LETTER_WEIGHT = {}
+do
+    local w = 1
+    for ch in UK_ALPHABET:gmatch("[\128-\255][\128-\191]*") do
+        UK_LETTER_WEIGHT[ch] = w
+        w = w + 1
+    end
+end
+
+local function ukSortKey(s)
+    local parts = {}
+    for ch in (s or ""):gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+        local wgt = UK_LETTER_WEIGHT[ch]
+        if wgt then
+            table.insert(parts, string.char(wgt))
+        else
+            -- не літера укр. абетки (ASCII, цифра, пунктуація) — лишаємо
+            -- як є, за одним байтом-роздільником поза діапазоном ваг вище
+            table.insert(parts, string.char(255) .. ch)
+        end
+    end
+    return table.concat(parts)
+end
+
+local function ukNameLess(a, b)
+    return ukSortKey(ukLower(a)) < ukSortKey(ukLower(b))
+end
+
 local function trim(s)
     return (s or ""):gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", " ")
 end
@@ -1996,8 +2030,13 @@ function CharCards:onAddFactToCharacter(quote)
     end
 
     local self_ref = self
+
+    local sorted_cards = {}
+    for _, c in ipairs(cards) do table.insert(sorted_cards, c) end
+    table.sort(sorted_cards, function(a, b) return ukNameLess(a.name, b.name) end)
+
     local items = {}
-    for _, c in ipairs(cards) do
+    for _, c in ipairs(sorted_cards) do
         table.insert(items, {
             text     = c.name,
             callback = function()
@@ -2252,8 +2291,15 @@ function CharCards:showCardList()
     end
 
     local self_ref = self
+
+    -- Сортуємо КОПІЮ для показу за іменем (алфавітом), а не за порядком
+    -- додавання — сам порядок у сховищі не чіпаємо (не впливає на серії/кеш).
+    local sorted_cards = {}
+    for _, c in ipairs(cards) do table.insert(sorted_cards, c) end
+    table.sort(sorted_cards, function(a, b) return ukNameLess(a.name, b.name) end)
+
     local items = {}
-    for _, c in ipairs(cards) do
+    for _, c in ipairs(sorted_cards) do
         table.insert(items, {
             text     = c.name,
             callback = function() self_ref:showCardView(c) end,
