@@ -4,7 +4,7 @@ A fully manual, AI-assisted character tracker plugin for [KOReader](https://gith
 
 **No background scanning, no automatic character extraction — you decide when a character gets added and what counts as new information about them.**
 
-CharCards was originally created for Ukrainian readers and the interface and Gemini prompts are Ukrainian by default. An **English localization patch** is now included, so the plugin can also be used in English.
+CharCards was originally created for Ukrainian readers and the interface and Gemini prompts are Ukrainian by default. An **English localization patch** is available in a separate repository, so the plugin can also be used in English.
 
 ## English
 
@@ -168,13 +168,11 @@ return "your_key_here"
 
 ### English localization
 
-The plugin itself is Ukrainian by default, but an English localization patch is included in the repository.
+The plugin itself is Ukrainian by default. The English localization patch lives in its own repository: [poostoon/charcards-en-patch](https://github.com/poostoon/charcards-en-patch).
 
-**Download the patch:** [`1-charcards-en.lua`](https://github.com/poostoon/charcards/blob/main/patches/1-charcards-en.lua) ([raw file](https://raw.githubusercontent.com/poostoon/charcards/main/patches/1-charcards-en.lua)).
+**Download the patch:** [`1-charcards-en.lua`](https://github.com/poostoon/charcards-en-patch/blob/main/1-charcards-en.lua) ([raw file](https://raw.githubusercontent.com/poostoon/charcards-en-patch/main/1-charcards-en.lua)).
 
-The patch is distributed together with the plugin and is not listed separately in Storefront, so please download it from the link above.
-
-Copy the file (`patches/1-charcards-en.lua` in the repository) to:
+Copy the file to:
 
 ```text
 /koreader/patches/
@@ -321,13 +319,7 @@ MIT — see [LICENSE](https://github.com/poostoon/charcards/blob/main/LICENSE).
 
 ### Localization / English
 
-Для англійського інтерфейсу скопіюй:
-
-```text
-patches/1-charcards-en.lua
-```
-
-у:
+Англійський патч лежить в окремому репозиторії: [poostoon/charcards-en-patch](https://github.com/poostoon/charcards-en-patch). Для англійського інтерфейсу завантаж [`1-charcards-en.lua`](https://github.com/poostoon/charcards-en-patch/blob/main/1-charcards-en.lua) і скопіюй його у:
 
 ```text
 /koreader/patches/
