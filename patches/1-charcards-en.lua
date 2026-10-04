@@ -60,6 +60,18 @@ userpatch.registerPatchPluginFunc("charcards", function(CharCardsClass)
     L.btn_delete = "Delete"
     L.btn_save = "Save"
     L.btn_unlink = "Unlink"
+
+    -- Undo last action
+    L.btn_keep = "Keep"
+    L.btn_undo_confirm = "Undo"
+    L.menu_undo_none = "Undo last action"
+    L.menu_undo_update = "Undo: update of «{{name}}»"
+    L.menu_undo_create = "Undo: adding «{{name}}»"
+    L.undo_confirm_update = "Undo the last update to «{{name}}»'s card?\n\nThe card will go back to how it was before that update."
+    L.undo_confirm_create = "Undo adding the character «{{name}}»?\n\nThe card will be deleted."
+    L.undo_done = "Undone."
+    L.undo_nothing = "Nothing to undo."
+    L.undo_char_missing = "That character no longer exists — nothing to undo."
     L.change_character_btn = "Edit character"
     L.character_not_found_db = "Character not found in the database (deleted?)."
     L.characters_count_only = " character(s)"

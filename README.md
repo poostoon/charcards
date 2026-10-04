@@ -60,6 +60,30 @@ This means you can decide yourself which passages are important enough to add to
 
 You can also edit every field of a character card manually.
 
+### Undo the last action
+
+Selected the wrong character by mistake, or added a character you didn't want? You can undo it.
+
+Open:
+
+**Character Cards → Undo last action**
+
+CharCards asks for confirmation (**Undo** / **Keep**) and then reverts the last change:
+
+* **Add to Character** — the character card goes back to exactly how it was before that update;
+* **Add Character** — the newly created card is removed.
+
+The menu item is greyed out when there is nothing to undo. Once you have done something that can be undone, its name tells you exactly what will be reverted, for example **Undo: update of «Jack»**.
+
+Good to know:
+
+* Only the **last** action can be undone — there is no multi-step history.
+* Undo is available while the book is open. Closing the book clears it.
+* If you change the cards afterwards (edit a card manually or delete a character), the undo is no longer available. This way it can never overwrite your later changes.
+* Undo works offline and does not send anything to Gemini.
+
+After undoing a wrong update, just select the passage again and add it to the right character.
+
 ### Character names and aliases
 
 CharCards can optionally underline character names and aliases directly in the text.
@@ -240,6 +264,17 @@ MIT — see [LICENSE](https://github.com/poostoon/charcards/blob/main/LICENSE).
 
 * **Ручне редагування.** Будь-яке поле картки (включно з ім'ям) можна
   виправити вручну через «Змінити персонажа» — окремий діалог на кожне поле.
+
+* **Скасувати останню дію.** Якщо додав інформацію не тому персонажу (чи
+  додав зайвого) — відкрий **Картки персонажів → Скасувати останню дію**.
+  Плагін перепитає й поверне картку до стану до цього оновлення (або
+  видалить щойно створену). Поки нема що скасовувати, пункт неактивний; після
+  дії в ньому видно, що саме буде скасовано (наприклад, «Скасувати:
+  оновлення «Джек»»). Скасовується лише **остання** дія, і лише поки
+  відкрита книга. Якщо після неї ти вручну змінив картку чи видалив
+  персонажа — скасування стає недоступним, щоб не затерти твої пізніші
+  правки. Працює без інтернету. Після скасування просто виділи уривок ще раз
+  і додай до потрібного персонажа.
 
 * **Серія книг.** За замовчуванням кожна книга ізольована — свій окремий
   набір персонажів. Якщо книга — частина серії, її можна прив'язати до

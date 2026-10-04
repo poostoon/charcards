@@ -73,6 +73,17 @@ local function fillTemplate(tpl, vars)
 end
 
 local L = {
+    -- Скасування останньої дії
+    btn_keep = "Залишити",
+    btn_undo_confirm = "Скасувати дію",
+    menu_undo_none = "Скасувати останню дію",
+    menu_undo_update = "Скасувати: оновлення «{{name}}»",
+    menu_undo_create = "Скасувати: додавання «{{name}}»",
+    undo_confirm_update = "Скасувати останнє оновлення картки «{{name}}»?\n\nКартка повернеться до стану до цього оновлення.",
+    undo_confirm_create = "Скасувати додавання персонажа «{{name}}»?\n\nКартку буде видалено.",
+    undo_done = "Скасовано.",
+    undo_nothing = "Нема чого скасовувати.",
+    undo_char_missing = "Цього персонажа вже нема — скасовувати нічого.",
     prompt_create_character = "Ти аналізуєш уривок художньої книги українською мовою.\n\n" ..
         "Уривок (кілька останніх сторінок, які читач щойно прочитав):\n\"\"\"\n{{context}}\n\"\"\"\n\n" ..
         "У цьому уривку згадується персонаж на ім'я «{{name}}». Склади про нього " ..
@@ -373,8 +384,52 @@ local function ukNameLess(a, b)
     return ukSortKey(ukLower(a)) < ukSortKey(ukLower(b))
 end
 
+-- Невидимі й "екзотичні" символи, що трапляються в тексті EPUB і у відповідях
+-- Gemini: на екрані вони виглядають як звичайний пробіл чи взагалі непомітні,
+-- але для порівняння рядків це ІНШІ байти ("Джек Сойєр" з нерозривним
+-- пробілом не дорівнює "Джек Сойєр" зі звичайним).
+local INVISIBLE_SEQS = {
+    "\194\173",                                  -- U+00AD м'який перенос
+    "\226\128\139", "\226\128\140", "\226\128\141",  -- U+200B/C/D нульової ширини
+    "\226\128\142", "\226\128\143",           -- U+200E/F позначки напрямку
+    "\226\129\160",                              -- U+2060
+    "\239\187\191",                              -- U+FEFF
+}
+local SPACE_SEQS = {
+    "\194\160",       -- U+00A0 нерозривний пробіл
+    "\226\128\175",  -- U+202F вузький нерозривний пробіл
+    "\227\128\128",  -- U+3000
+}
+for b = 0x82, 0x8A do SPACE_SEQS[#SPACE_SEQS + 1] = string.char(0xE2, 0x80, b) end  -- U+2002..U+200A
+-- Літери, які Unicode дозволяє записати двома символами (розкладена форма)
+local COMPOSE_SEQS = {
+    { "\208\184\204\134", "\208\185" },  -- и + ◌̆ -> й
+    { "\208\152\204\134", "\208\153" },  -- И + ◌̆ -> Й
+    { "\209\150\204\136", "\209\151" },  -- і + ◌̈ -> ї
+    { "\208\134\204\136", "\208\135" },  -- І + ◌̈ -> Ї
+}
+
+local function cleanText(s)
+    s = tostring(s or "")
+    for _, q in ipairs(INVISIBLE_SEQS) do s = s:gsub(q, "") end
+    for _, q in ipairs(SPACE_SEQS) do s = s:gsub(q, " ") end
+    for _, pair in ipairs(COMPOSE_SEQS) do s = s:gsub(pair[1], pair[2]) end
+    return (s:gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", " "))
+end
+
+-- trim тепер прибирає й невидимі символи (не лише ASCII-пробіли) — усе, що
+-- проходить через нього (імена, псевдоніми, поля), стає "чистим" рядком.
 local function trim(s)
-    return (s or ""):gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", " ")
+    return cleanText(s)
+end
+
+local APOSTROPHE_SEQS = { "\226\128\153", "\202\188", "\226\128\152", "`", "\194\180" }
+-- Ключ для порівняння імен: без невидимих символів, регістронезалежний
+-- (кирилиця теж), усі різновиди апострофа (' ’ ʼ ‘ ` ´) зведені до одного.
+local function nameKey(s)
+    s = cleanText(s)
+    for _, q in ipairs(APOSTROPHE_SEQS) do s = s:gsub(q, "'") end
+    return ukLower(s)
 end
 
 -- ===== JSON-виклик Gemini =====
@@ -714,6 +769,36 @@ end
 
 -- ===== Зберігання карток (сайдкар книги — або спільний файл серії, якщо привʼязано) =====
 
+-- Глибока копія картки/списку карток (вкладені таблиці зі строк і масивів).
+local function deepCopy(v)
+    if type(v) ~= "table" then return v end
+    local out = {}
+    for k, x in pairs(v) do out[k] = deepCopy(x) end
+    return out
+end
+
+-- Наводить лад в іменах і псевдонімах: чистить невидимі символи, прибирає
+-- псевдоніми, що дублюють ім'я картки або один одного (з урахуванням
+-- регістру, апострофів і невидимих символів). Викликається і при читанні
+-- (loadCards), і при записі (saveCards) — тож старі "брудні" дані
+-- виправляються самі, а нові не потрапляють у сховище.
+local function sanitizeCards(cards)
+    for _, c in ipairs(cards) do
+        c.name = cleanText(c.name)
+        local seen, cleaned = { [nameKey(c.name)] = true }, {}
+        for _, a in ipairs(c.aliases or {}) do
+            a = cleanText(a)
+            local k = nameKey(a)
+            if a ~= "" and not seen[k] then
+                seen[k] = true
+                cleaned[#cleaned + 1] = a
+            end
+        end
+        c.aliases = cleaned
+    end
+    return cards
+end
+
 -- Підпис набору персонажів (імена+псевдоніми) — використовується і для
 -- кешу підкреслень, і тут, щоб зрозуміти, чи saveCards() реально додав/
 -- прибрав якесь ІМʼЯ (а не просто оновив поле в уже наявного персонажа).
@@ -750,16 +835,22 @@ local function newTermsSince(old_cards, new_cards)
     return new_terms
 end
 
+-- Завжди повертає ГЛИБОКУ КОПІЮ збережених карток. Раніше віддавалась сама
+-- збережена таблиця (readSetting повертає посилання), тож виклики, що правили
+-- її "на місці", змінювали сховище ще ДО saveCards() — і той, порівнюючи
+-- "старе" з "новим", бачив дві однакові таблиці: пересканування підкреслень
+-- після нового персонажа чи псевдоніма не планувалось ніколи. З копією
+-- "старе" в saveCards() — це справді те, що зараз збережено.
 local function loadCards(self)
     local series_id = getSeriesId(self)
     if series_id then
         local data = getSeriesFile(series_id):readSetting("cards")
         if type(data) ~= "table" then data = {} end
-        return data
+        return sanitizeCards(deepCopy(data))
     end
     local data = self.ui.doc_settings and self.ui.doc_settings:readSetting("charcards")
     if type(data) ~= "table" then data = {} end
-    return data
+    return sanitizeCards(deepCopy(data))
 end
 
 -- Пересканування (і, відповідно, підкреслення) запускаємо ЛИШЕ якщо набір
@@ -767,6 +858,12 @@ end
 -- наявного. Просте оновлення поля (характер, звʼязки тощо) на пошук у
 -- тексті ніяк не впливає, тож і сканувати книгу заново нема сенсу.
 local function saveCards(self, cards)
+    -- Будь-яка зміна карток робить запис для "Скасувати" застарілим (скасування
+    -- затерло б пізнішу правку). Дія, яку можна скасувати, виставляє
+    -- self._cc_undo вже ПІСЛЯ цього виклику.
+    self._cc_undo = nil
+    sanitizeCards(cards)
+
     local old_cards = loadCards(self)
     local old_sig = cardsSignature(old_cards)
     local new_sig = cardsSignature(cards)
@@ -775,10 +872,10 @@ local function saveCards(self, cards)
     local series_id = getSeriesId(self)
     if series_id then
         local s = getSeriesFile(series_id)
-        s:saveSetting("cards", cards)
+        s:saveSetting("cards", deepCopy(cards))
         s:flush()
     elseif self.ui.doc_settings then
-        self.ui.doc_settings:saveSetting("charcards", cards)
+        self.ui.doc_settings:saveSetting("charcards", deepCopy(cards))
         self.ui.doc_settings:flush()
     else
         return
@@ -789,13 +886,29 @@ local function saveCards(self, cards)
     end
 end
 
+-- Застосовує запис скасування до списку карток: "ok" або "missing" (персонажа
+-- вже нема). Чиста функція — окремо від інтерфейсу, щоб легко тестувалась.
+local function applyUndo(cards, rec)
+    for i, c in ipairs(cards) do
+        if c.id == rec.id then
+            if rec.kind == "create" then
+                table.remove(cards, i)
+            else
+                cards[i] = deepCopy(rec.before)
+            end
+            return "ok"
+        end
+    end
+    return "missing"
+end
+
 local function findCardByName(cards, name)
-    local target = ukLower(trim(name))
+    local target = nameKey(name)
     for _, c in ipairs(cards) do
-        if ukLower(c.name) == target then return c end
+        if nameKey(c.name) == target then return c end
         if c.aliases then
             for _, a in ipairs(c.aliases) do
-                if ukLower(a) == target then return c end
+                if nameKey(a) == target then return c end
             end
         end
     end
@@ -822,17 +935,19 @@ end
 
 -- Додає нові елементи в масив (aliases/relationships) з дедуплікацією
 -- проти вже наявних (регістронезалежно, кирилиця враховується).
-local function mergeArrayField(existing, new_items)
+local function mergeArrayField(existing, new_items, exclude_key)
     existing = existing or {}
     if type(new_items) ~= "table" then return existing, false end
     local seen = {}
-    for _, v in ipairs(existing) do seen[ukLower(trim(v))] = true end
+    if exclude_key then seen[exclude_key] = true end  -- напр. ім'я картки для псевдонімів
+    for _, v in ipairs(existing) do seen[nameKey(v)] = true end
     local added = false
     for _, v in ipairs(new_items) do
         v = trim(v)
-        if v ~= "" and not seen[ukLower(v)] then
+        local k = nameKey(v)
+        if v ~= "" and not seen[k] then
             table.insert(existing, v)
-            seen[ukLower(v)] = true
+            seen[k] = true
             added = true
         end
     end
@@ -862,7 +977,7 @@ local function mergeUpdateIntoCard(card, update)
     setTextField("personality", "характер")
     setTextField("background", "бекграунд")
 
-    local new_aliases, aliases_changed = mergeArrayField(card.aliases, update.aliases)
+    local new_aliases, aliases_changed = mergeArrayField(card.aliases, update.aliases, nameKey(card.name))
     card.aliases = new_aliases
     if aliases_changed then table.insert(changed, "інші імена") end
 
@@ -925,7 +1040,7 @@ local function combineCardsForSeries(existing, incoming)
     existing.background = new_bg
     if bg_changed then table.insert(changed, "бекграунд") end
 
-    local new_aliases, aliases_changed = mergeArrayField(existing.aliases, incoming.aliases)
+    local new_aliases, aliases_changed = mergeArrayField(existing.aliases, incoming.aliases, nameKey(existing.name))
     existing.aliases = new_aliases
     if aliases_changed then table.insert(changed, "інші імена") end
 
@@ -1661,6 +1776,33 @@ function CharCards:_incrementalScan(new_terms)
     UIManager:scheduleIn(0.02, step)
 end
 
+-- ===== Скасувати останню дію (додавання персонажа / оновлення картки) =====
+
+function CharCards:undoLastAction()
+    local rec = self._cc_undo
+    if not rec then
+        UIManager:show(InfoMessage:new{ text = L.undo_nothing, timeout = 2 })
+        return
+    end
+    local self_ref = self
+    UIManager:show(ConfirmBox:new{
+        text = fillTemplate(rec.kind == "create" and L.undo_confirm_create or L.undo_confirm_update,
+                            { name = rec.name }),
+        ok_text     = L.btn_undo_confirm,
+        cancel_text = L.btn_keep,
+        ok_callback = function()
+            local cards = loadCards(self_ref)
+            if applyUndo(cards, rec) ~= "ok" then
+                self_ref._cc_undo = nil
+                UIManager:show(InfoMessage:new{ text = L.undo_char_missing, timeout = 3 })
+                return
+            end
+            saveCards(self_ref, cards)   -- заодно скидає _cc_undo і, за потреби, плановує пересканування
+            UIManager:show(InfoMessage:new{ text = L.undo_done, timeout = 2 })
+        end,
+    })
+end
+
 function CharCards:addToMainMenu(menu_items)
     local self_ref = self
     menu_items.charcards = {
@@ -1670,6 +1812,16 @@ function CharCards:addToMainMenu(menu_items)
             {
                 text     = L.menu_card_list,
                 callback = function() self_ref:showCardList() end,
+            },
+            {
+                text_func = function()
+                    local rec = self_ref._cc_undo
+                    if not rec then return L.menu_undo_none end
+                    return fillTemplate(rec.kind == "create" and L.menu_undo_create or L.menu_undo_update,
+                                        { name = rec.name })
+                end,
+                enabled_func = function() return self_ref._cc_undo ~= nil end,
+                callback = function() self_ref:undoLastAction() end,
             },
             {
                 text_func = function()
@@ -1947,6 +2099,7 @@ function CharCards:onAddNewCharacter(name)
         UIManager:show(InfoMessage:new{ text = L.no_book_open })
         return
     end
+    name = trim(name)   -- виділений у книзі текст може містити нерозривні пробіли, м'які переноси тощо
 
     local cards = loadCards(self)
     local existing = findCardByName(cards, name)
@@ -1982,7 +2135,7 @@ function CharCards:onAddNewCharacter(name)
         if type(result.aliases) == "table" then
             for _, a in ipairs(result.aliases) do
                 a = trim(a)
-                if a ~= "" and ukLower(a) ~= ukLower(name) then table.insert(aliases, a) end
+                if a ~= "" and nameKey(a) ~= nameKey(name) then table.insert(aliases, a) end
             end
         end
         local relationships = {}
@@ -2008,6 +2161,7 @@ function CharCards:onAddNewCharacter(name)
         local cards2 = loadCards(self_ref)
         table.insert(cards2, card)
         saveCards(self_ref, cards2)
+        self_ref._cc_undo = { kind = "create", id = card.id, name = card.name }
 
         UIManager:show(InfoMessage:new{ text = L.added_colon .. card.name, timeout = 2 })
         self_ref:showCardView(card)
@@ -2085,6 +2239,7 @@ function CharCards:_submitFact(card, quote)
             return
         end
 
+        local before = deepCopy(target)
         local changed = mergeUpdateIntoCard(target, result)
         if #changed == 0 then
             UIManager:show(InfoMessage:new{ text = L.nothing_new_from_quote, timeout = 3 })
@@ -2092,6 +2247,7 @@ function CharCards:_submitFact(card, quote)
         end
 
         saveCards(self_ref, cards)
+        self_ref._cc_undo = { kind = "update", id = target.id, name = target.name, before = before }
         UIManager:show(InfoMessage:new{
             text = L.updated_colon .. target.name .. "»: " .. table.concat(changed, ", "),
             timeout = 4,
