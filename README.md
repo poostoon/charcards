@@ -170,13 +170,11 @@ return "your_key_here"
 
 The plugin itself is Ukrainian by default, but an English localization patch is included in the repository.
 
-Copy:
+**Download the patch:** [`1-charcards-en.lua`](https://github.com/poostoon/charcards/blob/main/patches/1-charcards-en.lua) ([raw file](https://raw.githubusercontent.com/poostoon/charcards/main/patches/1-charcards-en.lua)).
 
-```text
-patches/1-charcards-en.lua
-```
+The patch is distributed together with the plugin and is not listed separately in Storefront, so please download it from the link above.
 
-to:
+Copy the file (`patches/1-charcards-en.lua` in the repository) to:
 
 ```text
 /koreader/patches/
